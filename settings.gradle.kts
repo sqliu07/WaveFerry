@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ShengduCast"
+rootProject.name = "WaveFerry"
 include(":app")
