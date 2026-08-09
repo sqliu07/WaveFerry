@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">WaveFerry mark</title>
+  <path
+    d="M112 256 C150 168 194 168 232 256 C270 344 314 344 352 256 H400"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="24"
+    stroke-linecap="round"
+    stroke-linejoin="round" />
+  <path
+    d="M368 220 L404 256 L368 292"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="24"
+    stroke-linecap="round"
+    stroke-linejoin="round" />
+</svg>

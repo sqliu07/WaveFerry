@@ -1,5 +1,19 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 48 48" role="img" aria-labelledby="title">
-  <title id="title">WaveFerry app logo</title>
-  <circle cx="24" cy="24" r="21" fill="#2563EB" />
-  <path fill="#FFFFFF" d="M28,12V27.2A6,6 0,1 1,24 21.55V16H36V12H28M20,32A3,3 0,1 0,20 26A3,3 0,1 0,20 32" />
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">WaveFerry logo</title>
+  <desc id="desc">A minimal sound wave that becomes a right-pointing transfer arrow.</desc>
+  <circle cx="256" cy="256" r="224" fill="#2563EB" />
+  <path
+    d="M112 256 C150 168 194 168 232 256 C270 344 314 344 352 256 H400"
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-width="24"
+    stroke-linecap="round"
+    stroke-linejoin="round" />
+  <path
+    d="M368 220 L404 256 L368 292"
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-width="24"
+    stroke-linecap="round"
+    stroke-linejoin="round" />
 </svg>

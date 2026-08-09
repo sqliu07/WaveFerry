@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/waveferry-logo.svg" alt="声渡 / WaveFerry Logo" width="120">
+  <img src="docs/assets/waveferry-logo.svg" alt="WaveFerry 波形传输应用图标" width="120">
 </p>
 
 <h1 align="center">声渡 / WaveFerry</h1>
@@ -58,6 +58,14 @@ Android 14 及以上会在每次投送前显示系统级捕获对话框，让用
 ```bash
 ./gradlew :app:assembleDebug
 ```
+
+构建未签名发布包：
+
+```bash
+./gradlew :app:assembleRelease
+```
+
+发布 APK 位于 `app/build/outputs/apk/release/`。安装或分发前需要使用自己的签名密钥完成签名；签名文件和密码不应提交到仓库。
 
 完整本地验证：
 
