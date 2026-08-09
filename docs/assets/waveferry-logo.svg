@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 48 48" role="img" aria-labelledby="title">
+  <title id="title">WaveFerry app logo</title>
+  <circle cx="24" cy="24" r="21" fill="#2563EB" />
+  <path fill="#FFFFFF" d="M28,12V27.2A6,6 0,1 1,24 21.55V16H36V12H28M20,32A3,3 0,1 0,20 26A3,3 0,1 0,20 32" />
+</svg>

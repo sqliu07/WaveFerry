@@ -1,4 +1,8 @@
-# 声渡 / WaveFerry
+<p align="center">
+  <img src="docs/assets/waveferry-logo.svg" alt="声渡 / WaveFerry Logo" width="120">
+</p>
+
+<h1 align="center">声渡 / WaveFerry</h1>
 
 声渡（WaveFerry）是一款面向 Android 12 及以上设备的局域网音频投送应用。它读取用户授权应用正在播放的音频，并通过 AirPlay 1 / RAOP 发送到同一局域网内的电视、盒子或音响。
 
