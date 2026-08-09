@@ -1,0 +1,45 @@
+<resources>
+    <string name="app_name">声渡</string>
+
+    <string name="main_title">声渡</string>
+    <string name="open_settings">打开设置</string>
+
+    <string name="status_ready">等待开始</string>
+    <string name="status_stopping">正在停止…</string>
+    <string name="projection_waiting">等待系统录音授权…</string>
+    <string name="status_connecting_receiver">正在连接 %1$s…</string>
+
+    <string name="receiver_empty">未发现设备</string>
+    <string name="receiver_incompatible_generic">该设备暂不支持</string>
+    <string name="discovery_scanning">正在扫描设备…</string>
+    <string name="discovery_rescanning">正在重新扫描…</string>
+    <string name="discovery_error">扫描失败：%1$s</string>
+    <plurals name="discovery_found">
+        <item quantity="other">已发现 %d 台设备</item>
+    </plurals>
+    <string name="scan">扫描</string>
+    <string name="start_streaming">开始</string>
+    <string name="stop_streaming">停止</string>
+    <string name="permission_required_audio">需要录音权限才能投送音频</string>
+    <string name="permission_required_notifications">需要通知权限来显示投送状态</string>
+    <string name="projection_cancelled">已取消系统录音授权</string>
+    <string name="receiver_address_error">设备地址不可用：%1$s</string>
+
+    <string name="now_playing_title">正在播放</string>
+    <string name="now_playing_empty">暂无播放内容</string>
+    <string name="now_playing_unknown">未知歌曲</string>
+    <string name="now_playing_artist_album">%1$s · %2$s</string>
+
+    <string name="settings_title">设置</string>
+    <string name="close_settings">返回</string>
+    <string name="settings_playback_title">播放</string>
+    <string name="option_mute_device">投送时静音本机媒体音量</string>
+    <string name="settings_notification_title">通知使用权</string>
+    <string name="settings_notification_access_on">已开启 · 点击管理</string>
+    <string name="settings_notification_access_off">未开启 · 点击设置</string>
+
+    <string name="notification_channel_name">音频投送</string>
+    <string name="notification_title">正在投送设备音频</string>
+    <string name="notification_error_title">音频投送失败</string>
+    <string name="notification_stop">停止</string>
+</resources>

@@ -1,0 +1,10 @@
+<ripple xmlns:android="http://schemas.android.com/apk/res/android" android:color="@color/shengdu_ripple_light">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/shengdu_background" />
+            <stroke
+                android:width="1dp"
+                android:color="@color/shengdu_border" />
+        </shape>
+    </item>
+</ripple>

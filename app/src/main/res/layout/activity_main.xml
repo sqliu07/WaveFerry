@@ -1,0 +1,174 @@
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/main_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingLeft="@dimen/page_padding"
+        android:paddingTop="@dimen/space_xl"
+        android:paddingRight="@dimen/page_padding"
+        android:paddingBottom="@dimen/space_xl">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/main_title"
+            style="@style/Shengdu.Title" />
+
+        <ImageButton
+            android:id="@+id/button_open_settings"
+            android:layout_width="@dimen/touch_target"
+            android:layout_height="@dimen/touch_target"
+            android:contentDescription="@string/open_settings"
+            android:src="@drawable/ic_settings_24"
+            style="@style/Shengdu.IconButton" />
+    </LinearLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="@dimen/space_section"
+        android:background="@color/shengdu_border" />
+
+    <Spinner
+        android:id="@+id/spinner_receivers"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/space_section"
+        android:spinnerMode="dropdown"
+        style="@style/Shengdu.Spinner" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/space_m"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/button_scan"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/scan"
+            style="@style/Shengdu.Button.Secondary" />
+
+        <Button
+            android:id="@+id/button_start"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="@dimen/space_s"
+            android:layout_weight="1"
+            android:enabled="false"
+            android:text="@string/start_streaming"
+            style="@style/Shengdu.Button.Primary" />
+    </LinearLayout>
+
+    <Button
+        android:id="@+id/button_stop"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/space_s"
+        android:text="@string/stop_streaming"
+        android:visibility="gone"
+        style="@style/Shengdu.Button.Danger" />
+
+    <TextView
+        android:id="@+id/text_discovery_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/space_section"
+        android:text="@string/discovery_scanning"
+        style="@style/Shengdu.Status" />
+
+    <TextView
+        android:id="@+id/text_session_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/space_s"
+        android:text="@string/status_ready"
+        style="@style/Shengdu.Status" />
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="@dimen/space_section"
+        android:background="@color/shengdu_border" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/space_section"
+        android:text="@string/now_playing_title"
+        style="@style/Shengdu.SectionTitle" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/space_m"
+        android:baselineAligned="false"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <FrameLayout
+            android:layout_width="@dimen/artwork_size"
+            android:layout_height="@dimen/artwork_size"
+            android:background="@color/shengdu_surface">
+
+            <ImageView
+                android:id="@+id/image_artwork"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:importantForAccessibility="no"
+                android:scaleType="centerCrop"
+                android:visibility="gone" />
+
+            <ImageView
+                android:id="@+id/image_artwork_placeholder"
+                android:layout_width="@dimen/artwork_placeholder_size"
+                android:layout_height="@dimen/artwork_placeholder_size"
+                android:layout_gravity="center"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ic_music_note_24"
+                android:tint="@color/shengdu_text_secondary" />
+        </FrameLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="@dimen/space_l"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/text_track_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="2"
+                android:text="@string/now_playing_empty"
+                style="@style/Shengdu.NowPlayingTitle" />
+
+            <TextView
+                android:id="@+id/text_track_subtitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/space_s"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:visibility="gone"
+                style="@style/Shengdu.NowPlayingSubtitle" />
+        </LinearLayout>
+    </LinearLayout>
+    </LinearLayout>
+</ScrollView>

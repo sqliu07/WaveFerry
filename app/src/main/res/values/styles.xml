@@ -1,0 +1,97 @@
+<resources>
+    <style name="Theme.Shengdu" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/shengdu_background</item>
+        <item name="android:colorBackground">@color/shengdu_background</item>
+        <item name="android:colorPrimary">@color/shengdu_accent</item>
+        <item name="android:colorAccent">@color/shengdu_accent</item>
+        <item name="android:textColorPrimary">@color/shengdu_text_primary</item>
+        <item name="android:textColorSecondary">@color/shengdu_text_secondary</item>
+        <item name="android:navigationBarColor">@color/shengdu_background</item>
+        <item name="android:statusBarColor">@color/shengdu_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+
+    <style name="Shengdu" />
+    <style name="Shengdu.Button" />
+
+    <style name="Shengdu.Title">
+        <item name="android:textColor">@color/shengdu_text_primary</item>
+        <item name="android:textSize">28sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="Shengdu.SectionTitle">
+        <item name="android:textColor">@color/shengdu_text_primary</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="Shengdu.Status">
+        <item name="android:textSize">14sp</item>
+    </style>
+
+    <style name="Shengdu.NowPlayingTitle">
+        <item name="android:textColor">@color/shengdu_text_primary</item>
+        <item name="android:textSize">17sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="Shengdu.NowPlayingSubtitle">
+        <item name="android:textColor">@color/shengdu_text_secondary</item>
+        <item name="android:textSize">14sp</item>
+    </style>
+
+    <style name="Shengdu.Spinner">
+        <item name="android:background">@drawable/bg_surface</item>
+        <item name="android:minHeight">@dimen/touch_target</item>
+        <item name="android:paddingLeft">@dimen/space_m</item>
+        <item name="android:paddingTop">@dimen/space_s</item>
+        <item name="android:paddingRight">@dimen/space_m</item>
+        <item name="android:paddingBottom">@dimen/space_s</item>
+        <item name="android:popupBackground">@color/shengdu_background</item>
+    </style>
+
+    <style name="Shengdu.Button.Primary">
+        <item name="android:background">@drawable/bg_button_primary</item>
+        <item name="android:textColor">@android:color/white</item>
+        <item name="android:minHeight">@dimen/touch_target</item>
+        <item name="android:paddingLeft">@dimen/space_m</item>
+        <item name="android:paddingTop">@dimen/space_s</item>
+        <item name="android:paddingRight">@dimen/space_m</item>
+        <item name="android:paddingBottom">@dimen/space_s</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <style name="Shengdu.Button.Secondary">
+        <item name="android:background">@drawable/bg_button_secondary</item>
+        <item name="android:textColor">@color/shengdu_text_primary</item>
+        <item name="android:minHeight">@dimen/touch_target</item>
+        <item name="android:paddingLeft">@dimen/space_m</item>
+        <item name="android:paddingTop">@dimen/space_s</item>
+        <item name="android:paddingRight">@dimen/space_m</item>
+        <item name="android:paddingBottom">@dimen/space_s</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <style name="Shengdu.Button.Danger">
+        <item name="android:background">@drawable/bg_button_danger</item>
+        <item name="android:textColor">@color/shengdu_status_error</item>
+        <item name="android:minHeight">@dimen/touch_target</item>
+        <item name="android:paddingLeft">@dimen/space_m</item>
+        <item name="android:paddingTop">@dimen/space_s</item>
+        <item name="android:paddingRight">@dimen/space_m</item>
+        <item name="android:paddingBottom">@dimen/space_s</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <style name="Shengdu.IconButton">
+        <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>
+        <item name="android:minWidth">@dimen/touch_target</item>
+        <item name="android:minHeight">@dimen/touch_target</item>
+        <item name="android:padding">@dimen/space_s</item>
+        <item name="android:tint">@color/shengdu_text_primary</item>
+        <item name="android:scaleType">center</item>
+    </style>
+</resources>

@@ -1,0 +1,14 @@
+<resources>
+    <color name="shengdu_background">#FFFFFFFF</color>
+    <color name="shengdu_surface">#FFF2F2F2</color>
+    <color name="shengdu_border">#FFD9D9D9</color>
+    <color name="shengdu_text_primary">#FF111111</color>
+    <color name="shengdu_text_secondary">#FF555555</color>
+    <color name="shengdu_accent">#FF111111</color>
+    <color name="shengdu_status_success">#FF1F6B2A</color>
+    <color name="shengdu_status_warning">#FF8A5B00</color>
+    <color name="shengdu_status_error">#FFB42318</color>
+    <color name="shengdu_ripple_light">#14000000</color>
+    <color name="shengdu_ripple_accent">#22000000</color>
+    <color name="shengdu_ripple_error">#18B42318</color>
+</resources>
