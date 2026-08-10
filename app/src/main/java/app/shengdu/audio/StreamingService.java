@@ -69,6 +69,8 @@ public final class StreamingService extends Service {
     private static final String NOTIFICATION_CHANNEL_ID = "streaming";
     private static final int NOTIFICATION_ID = 1001;
     private static final int ERROR_NOTIFICATION_ID = 1002;
+    private static final int PCM_QUEUE_MAX_BYTES = 96 * 1024;
+    private static final long PCM_SENDER_STOP_WAIT_MS = 250;
     private static volatile StatusSnapshot lastStatus = new StatusSnapshot("", "");
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
@@ -80,6 +82,7 @@ public final class StreamingService extends Service {
     private final AtomicInteger sessionGeneration = new AtomicInteger();
 
     private RaopStreamingClient raopClient;
+    private AsyncPcmSender pcmSender;
     private PlaybackCapture playbackCapture;
     private MediaProjection mediaProjection;
     private DacpSession dacpSession;
@@ -206,6 +209,14 @@ public final class StreamingService extends Service {
             configureMetadata(client);
             client.connect();
             raopClient = client;
+
+            AsyncPcmSender sender = new AsyncPcmSender(
+                    PCM_QUEUE_MAX_BYTES,
+                    pcm -> client.writePcm(pcm, 0, pcm.length),
+                    client,
+                    error -> onPcmSenderFailure(generation, error));
+            sender.start();
+            pcmSender = sender;
             if (stopIfStale(generation)) {
                 return;
             }
@@ -256,19 +267,22 @@ public final class StreamingService extends Service {
     }
 
     private void writePcm(byte[] buffer, int byteCount) {
-        RaopStreamingClient client = raopClient;
-        if (client == null || stopping.get()) {
+        AsyncPcmSender sender = pcmSender;
+        if (sender == null || stopping.get() || !playbackFlowGate.shouldForwardPcm()) {
             return;
         }
-        synchronized (client) {
-            if (stopping.get() || client != raopClient || !playbackFlowGate.shouldForwardPcm()) {
-                return;
-            }
-            try {
-                client.writePcm(buffer, 0, byteCount);
-            } catch (IOException error) {
-                throw new UncheckedIOException(error);
-            }
+        try {
+            sender.offer(buffer, 0, byteCount);
+        } catch (IOException error) {
+            throw new UncheckedIOException(error);
+        }
+    }
+
+    private void onPcmSenderFailure(int generation, IOException error) {
+        if (sessionGeneration.compareAndSet(generation, generation + 1)
+                && stopping.compareAndSet(false, true)) {
+            broadcastStatus(STATUS_ERROR, readableError(error));
+            worker.execute(() -> stopSession(true, false));
         }
     }
 
@@ -517,6 +531,12 @@ public final class StreamingService extends Service {
             return;
         }
 
+        PlaybackCapture capture = playbackCapture;
+        playbackCapture = null;
+        if (capture != null) {
+            capture.stop();
+        }
+
         DacpSession remoteControl = dacpSession;
         dacpSession = null;
         if (remoteControl != null) {
@@ -526,26 +546,26 @@ public final class StreamingService extends Service {
         stopMetadata();
         restoreDeviceVolume();
 
-        PlaybackCapture capture = playbackCapture;
-        playbackCapture = null;
-        if (capture != null) {
-            capture.stop();
+        AsyncPcmSender sender = pcmSender;
+        pcmSender = null;
+        RaopStreamingClient client = raopClient;
+        raopClient = null;
+        if (sender != null) {
+            // Never let a receiver or Wi-Fi stall hold the foreground-service teardown.
+            // The daemon sender owns client.close() and will finish it when the socket unblocks.
+            sender.stop(PCM_SENDER_STOP_WAIT_MS);
+        } else if (client != null) {
+            try {
+                client.close();
+            } catch (IOException ignored) {
+                // The receiver may already have closed the session.
+            }
         }
 
         MediaProjection projection = mediaProjection;
         mediaProjection = null;
         if (projection != null) {
             projection.stop();
-        }
-
-        RaopStreamingClient client = raopClient;
-        raopClient = null;
-        if (client != null) {
-            try {
-                client.close();
-            } catch (IOException ignored) {
-                // The receiver may already have closed the session.
-            }
         }
         releaseNetworkLocks();
 
