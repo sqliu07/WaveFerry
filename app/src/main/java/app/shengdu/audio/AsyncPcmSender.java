@@ -136,7 +136,6 @@ final class AsyncPcmSender {
                 queue.clear();
                 queuedBytes = 0;
                 failure = terminalFailure;
-                thread = null;
                 lock.notifyAll();
             }
             if (terminalFailure != null) {
@@ -146,6 +145,13 @@ final class AsyncPcmSender {
                 closer.close();
             } catch (Exception ignored) {
                 // The receiver may already have gone away; sender shutdown stays best-effort.
+            } finally {
+                synchronized (lock) {
+                    if (thread == Thread.currentThread()) {
+                        thread = null;
+                    }
+                    lock.notifyAll();
+                }
             }
         }
     }
