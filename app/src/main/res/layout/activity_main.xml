@@ -1,4 +1,5 @@
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/main_root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -41,15 +42,42 @@
         android:layout_marginTop="@dimen/space_section"
         android:background="@color/shengdu_border" />
 
-    <Spinner
-        android:id="@+id/spinner_receivers"
+    <LinearLayout
+        android:id="@+id/receiver_header"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="@dimen/space_section"
-        android:spinnerMode="dropdown"
-        style="@style/Shengdu.Spinner" />
+        android:gravity="center_vertical"
+        android:minHeight="@dimen/touch_target"
+        android:orientation="horizontal"
+        tools:ignore="UseCompoundDrawables">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/receivers_title"
+            style="@style/Shengdu.SectionTitle" />
+
+        <ImageView
+            android:id="@+id/image_receiver_expand"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:importantForAccessibility="no"
+            android:src="@drawable/ic_expand_more_24"
+            android:tint="@color/shengdu_text_secondary"
+            android:visibility="gone" />
+    </LinearLayout>
 
     <LinearLayout
+        android:id="@+id/receiver_list"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/space_s"
+        android:orientation="vertical" />
+
+    <LinearLayout
+        android:id="@+id/receiver_actions"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="@dimen/space_m"

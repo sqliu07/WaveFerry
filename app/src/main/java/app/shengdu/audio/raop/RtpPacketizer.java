@@ -60,13 +60,20 @@ final class RtpPacketizer {
     }
 
     static byte[] buildUdpSyncPacket(long timestamp, boolean firstPacket) {
+        return buildUdpSyncPacket(timestamp, firstPacket, 44_100);
+    }
+
+    static byte[] buildUdpSyncPacket(long timestamp, boolean firstPacket, int sampleRateHz) {
+        if (sampleRateHz <= 0) {
+            throw new IllegalArgumentException("sampleRateHz must be positive");
+        }
         byte[] packet = new byte[20];
         packet[0] = (byte) (firstPacket ? 0x90 : 0x80);
         packet[1] = (byte) 0xd4;
         packet[2] = 0x00;
         packet[3] = 0x07;
 
-        long delayed = (timestamp - 88_200L) & 0xffffffffL;
+        long delayed = (timestamp - 2L * sampleRateHz) & 0xffffffffL;
         long nowNtp = currentNtpTimestamp();
         writeInt(packet, 4, delayed);
         writeLong32(packet, 8, nowNtp >>> 32);

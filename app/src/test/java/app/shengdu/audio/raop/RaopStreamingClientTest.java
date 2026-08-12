@@ -1,5 +1,8 @@
 package app.shengdu.audio.raop;
 
+import app.shengdu.audio.format.AudioStreamFormat;
+import app.shengdu.audio.format.SampleFormat;
+
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -33,6 +36,18 @@ import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 
 public class RaopStreamingClientTest {
+    @Test
+    public void acceptsNegotiated48KFormatWhenReceiverAdvertisesIt() {
+        RaopStreamingClient sender = new RaopStreamingClient(
+                InetAddress.getLoopbackAddress(),
+                7000,
+                txt("sr", "48000", "ss", "16", "ch", "2", "cn", "1", "et", "0"),
+                new AudioStreamFormat(48000, 2, SampleFormat.PCM16_LE));
+
+        assertEquals(RaopCompatibility.LEGACY_CLEAR, sender.compatibility());
+        assertEquals(48000, sender.sampleRateHz());
+    }
+
     @Test
     public void alacWrapperKeepsPcmAlignedAfterThe55BitHeader() {
         byte[] pcm = samplePcm(AlacPacketBuilder.FRAMES_PER_TCP_PACKET);

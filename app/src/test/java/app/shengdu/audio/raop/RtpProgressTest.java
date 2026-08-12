@@ -44,6 +44,13 @@ public final class RtpProgressTest {
     }
 
     @Test
+    public void negotiatedSampleRateControlsProgressTicks() {
+        long[] progress = RtpProgress.compute(1000, 2000, 5000, 48000);
+
+        assertArrayEquals(new long[] {4_294_924_296L, 5000, 53_000}, progress);
+    }
+
+    @Test
     public void rejectsNegativePositions() {
         try {
             RtpProgress.compute(-1, 0, 0);

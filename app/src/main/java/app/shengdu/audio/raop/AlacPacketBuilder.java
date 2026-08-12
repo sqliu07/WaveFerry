@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 package app.shengdu.audio.raop;
 
+import app.shengdu.audio.format.AudioStreamFormat;
+import app.shengdu.audio.format.SampleFormat;
+
 final class AlacPacketBuilder {
     static final int FRAMES_PER_TCP_PACKET = 4096;
     static final int FRAMES_PER_UDP_PACKET = 352;
@@ -19,6 +22,17 @@ final class AlacPacketBuilder {
     }
 
     static byte[] encodeUncompressedFrames(byte[] pcm, int offset, int length) {
+        return encodeUncompressedFrames(
+                new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE), pcm, offset, length);
+    }
+
+    static byte[] encodeUncompressedFrames(
+            AudioStreamFormat format, byte[] pcm, int offset, int length) {
+        if (format == null
+                || format.channelCount() != 2
+                || format.sampleFormat() != SampleFormat.PCM16_LE) {
+            throw new IllegalArgumentException("RAOP ALAC currently supports PCM16 stereo only");
+        }
         if (length <= 0 || length % PCM_BYTES_PER_FRAME != 0) {
             throw new IllegalArgumentException(
                     "RAOP ALAC packets require PCM bytes in full stereo PCM16 frames");

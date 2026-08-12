@@ -58,6 +58,59 @@
             android:textColor="@color/shengdu_text_primary"
             android:textSize="14sp" />
 
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_m"
+            android:text="@string/option_audio_quality"
+            android:textColor="@color/shengdu_text_primary"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/text_audio_quality_value"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_s"
+            android:minHeight="@dimen/touch_target"
+            android:gravity="center_vertical"
+            android:paddingLeft="@dimen/space_m"
+            android:paddingTop="@dimen/space_s"
+            android:paddingRight="@dimen/space_m"
+            android:paddingBottom="@dimen/space_s"
+            android:background="@drawable/bg_surface"
+            android:textColor="@color/shengdu_text_primary"
+            android:textSize="14sp"
+            android:drawableEnd="@drawable/ic_expand_more_24"
+            android:drawableTint="@color/shengdu_text_secondary"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <RadioGroup
+            android:id="@+id/audio_quality_options"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:visibility="gone"
+            android:background="@drawable/bg_surface"
+            android:layout_marginTop="1dp"
+            android:paddingLeft="@dimen/space_s"
+            android:paddingRight="@dimen/space_s">
+            <RadioButton
+                android:id="@+id/audio_quality_auto"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/audio_quality_auto" />
+            <RadioButton
+                android:id="@+id/audio_quality_44"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/audio_quality_44" />
+            <RadioButton
+                android:id="@+id/audio_quality_48"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/audio_quality_48" />
+        </RadioGroup>
+
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"

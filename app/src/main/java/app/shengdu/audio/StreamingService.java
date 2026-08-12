@@ -23,6 +23,8 @@ import app.shengdu.audio.audio.DeviceMutePolicy;
 import app.shengdu.audio.capture.PlaybackCapture;
 import app.shengdu.audio.dacp.DacpControlServer;
 import app.shengdu.audio.dacp.DacpSession;
+import app.shengdu.audio.dlna.DlnaRendererDescription;
+import app.shengdu.audio.dlna.DlnaStreamingClient;
 import app.shengdu.audio.metadata.MediaSessionMonitor;
 import app.shengdu.audio.metadata.MetadataSendPolicy;
 import app.shengdu.audio.metadata.PlaybackFlowGate;
@@ -30,11 +32,16 @@ import app.shengdu.audio.metadata.TrackMetadata;
 import app.shengdu.audio.metadata.TrackProgressSender;
 import app.shengdu.audio.raop.MetadataSupport;
 import app.shengdu.audio.raop.RaopStreamingClient;
+import app.shengdu.audio.format.AudioStreamFormat;
+import app.shengdu.audio.format.FormatNegotiator;
+import app.shengdu.audio.format.ReceiverCapabilities;
+import app.shengdu.audio.format.SampleFormat;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetAddress;
+import java.net.URI;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -49,13 +56,17 @@ public final class StreamingService extends Service {
     public static final String ACTION_STATUS = "app.shengdu.audio.action.STATUS";
     public static final String EXTRA_STATUS = "status";
     public static final String EXTRA_MESSAGE = "message";
+    public static final String EXTRA_RECEIVER_KEY = "receiver_key";
 
     public static final String STATUS_CONNECTING = "connecting";
+    public static final String STATUS_STOPPING = "stopping";
+    public static final String STATUS_AWAITING_CAPTURE = "awaiting_capture";
     public static final String STATUS_STREAMING = "streaming";
     public static final String STATUS_STOPPED = "stopped";
     public static final String STATUS_ERROR = "error";
 
-    private static final String ACTION_START = "app.shengdu.audio.action.START";
+    private static final String ACTION_PREPARE = "app.shengdu.audio.action.PREPARE";
+    private static final String ACTION_ATTACH_CAPTURE = "app.shengdu.audio.action.ATTACH_CAPTURE";
     private static final String ACTION_STOP = "app.shengdu.audio.action.STOP";
     private static final String EXTRA_PROJECTION_RESULT = "projection_result";
     private static final String EXTRA_PROJECTION_DATA = "projection_data";
@@ -63,13 +74,14 @@ public final class StreamingService extends Service {
     private static final String EXTRA_PORT = "port";
     private static final String EXTRA_RECEIVER_NAME = "receiver_name";
     private static final String EXTRA_MUTE_DEVICE = "mute_device";
+    private static final String EXTRA_AUDIO_QUALITY = "audio_quality";
     private static final String EXTRA_TXT_KEYS = "txt_keys";
     private static final String EXTRA_TXT_PREFIX = "txt_";
 
     private static final String NOTIFICATION_CHANNEL_ID = "streaming";
     private static final int NOTIFICATION_ID = 1001;
     private static final int ERROR_NOTIFICATION_ID = 1002;
-    private static volatile StatusSnapshot lastStatus = new StatusSnapshot("", "");
+    private static volatile StatusSnapshot lastStatus = new StatusSnapshot("", "", "");
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "shengdu-session");
@@ -80,6 +92,7 @@ public final class StreamingService extends Service {
     private final AtomicInteger sessionGeneration = new AtomicInteger();
 
     private RaopStreamingClient raopClient;
+    private DlnaStreamingClient dlnaClient;
     private PlaybackCapture playbackCapture;
     private MediaProjection mediaProjection;
     private DacpSession dacpSession;
@@ -91,6 +104,11 @@ public final class StreamingService extends Service {
     private MetadataSendPolicy metadataPolicy;
     private MetadataSendPolicy artworkPolicy;
     private MetadataSendPolicy progressPolicy;
+    private AudioStreamFormat activeFormat;
+    private String activeReceiverName = "";
+    private volatile String activeReceiverKey = "";
+    private boolean awaitingCapture;
+    private boolean activeMuteDevice;
     private final DeviceMutePolicy mutePolicy = new DeviceMutePolicy();
     private final PlaybackFlowGate playbackFlowGate = new PlaybackFlowGate();
     private final TrackProgressSender trackProgressSender = new TrackProgressSender();
@@ -98,22 +116,22 @@ public final class StreamingService extends Service {
     private static final int ARTWORK_MAX_DIMENSION = 512;
     private static final int ARTWORK_JPEG_QUALITY = 85;
 
-    public static Intent createStartIntent(
+    public static Intent createPrepareIntent(
             Context context,
-            int projectionResult,
-            Intent projectionData,
             InetAddress receiverAddress,
             int receiverPort,
             String receiverName,
+            String receiverKey,
             Map<String, byte[]> txtAttributes,
-            boolean muteDevice) {
-        Intent intent = new Intent(context, StreamingService.class).setAction(ACTION_START);
-        intent.putExtra(EXTRA_PROJECTION_RESULT, projectionResult);
-        intent.putExtra(EXTRA_PROJECTION_DATA, projectionData);
+            boolean muteDevice,
+            AppPreferences.AudioQuality audioQuality) {
+        Intent intent = new Intent(context, StreamingService.class).setAction(ACTION_PREPARE);
         intent.putExtra(EXTRA_HOST, receiverAddress.getHostAddress());
         intent.putExtra(EXTRA_PORT, receiverPort);
         intent.putExtra(EXTRA_RECEIVER_NAME, receiverName);
+        intent.putExtra(EXTRA_RECEIVER_KEY, receiverKey);
         intent.putExtra(EXTRA_MUTE_DEVICE, muteDevice);
+        intent.putExtra(EXTRA_AUDIO_QUALITY, audioQuality.name());
 
         String[] keys = txtAttributes.keySet().toArray(new String[0]);
         intent.putExtra(EXTRA_TXT_KEYS, keys);
@@ -121,6 +139,14 @@ public final class StreamingService extends Service {
             intent.putExtra(EXTRA_TXT_PREFIX + key, txtAttributes.get(key));
         }
         return intent;
+    }
+
+    public static Intent createAttachCaptureIntent(
+            Context context, int projectionResult, Intent projectionData) {
+        return new Intent(context, StreamingService.class)
+                .setAction(ACTION_ATTACH_CAPTURE)
+                .putExtra(EXTRA_PROJECTION_RESULT, projectionResult)
+                .putExtra(EXTRA_PROJECTION_DATA, projectionData);
     }
 
     public static Intent createStopIntent(Context context) {
@@ -145,10 +171,21 @@ public final class StreamingService extends Service {
         }
         if (ACTION_STOP.equals(intent.getAction())) {
             sessionGeneration.incrementAndGet();
+            broadcastStatus(STATUS_STOPPING, getString(R.string.status_stopping));
             worker.execute(() -> stopSession(true));
             return START_NOT_STICKY;
         }
-        if (!ACTION_START.equals(intent.getAction())) {
+        if (ACTION_ATTACH_CAPTURE.equals(intent.getAction())) {
+            startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification(getString(R.string.status_starting_capture)),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                            | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+            int generation = sessionGeneration.get();
+            worker.execute(() -> attachPlaybackCapture(intent, generation));
+            return START_NOT_STICKY;
+        }
+        if (!ACTION_PREPARE.equals(intent.getAction())) {
             stopSelf(startId);
             return START_NOT_STICKY;
         }
@@ -159,12 +196,16 @@ public final class StreamingService extends Service {
         }
         int generation = sessionGeneration.incrementAndGet();
         String sessionReceiverName = requestedReceiverName;
+        activeReceiverKey = intent.getStringExtra(EXTRA_RECEIVER_KEY);
+        if (activeReceiverKey == null) {
+            activeReceiverKey = "";
+        }
         startInForeground(sessionReceiverName);
-        worker.execute(() -> startSession(intent, generation, sessionReceiverName));
+        worker.execute(() -> prepareSession(intent, generation, sessionReceiverName));
         return START_NOT_STICKY;
     }
 
-    private void startSession(Intent intent, int generation, String sessionReceiverName) {
+    private void prepareSession(Intent intent, int generation, String sessionReceiverName) {
         if (!isCurrentGeneration(generation)) {
             return;
         }
@@ -175,7 +216,9 @@ public final class StreamingService extends Service {
         stopping.set(false);
         playbackFlowGate.reset();
         try {
-            broadcastStatus(STATUS_CONNECTING, "正在连接 " + sessionReceiverName + "…");
+            broadcastStatus(
+                    STATUS_CONNECTING,
+                    getString(R.string.status_connecting_receiver, sessionReceiverName));
             acquireNetworkLocks();
 
             InetAddress host = InetAddress.getByName(requiredStringExtra(intent, EXTRA_HOST));
@@ -185,54 +228,82 @@ public final class StreamingService extends Service {
             }
 
             Map<String, byte[]> txt = readTxtAttributes(intent);
+            boolean dlnaTarget = isDlnaTarget(txt);
+            // The live DLNA endpoint currently advertises PCM/WAV at 44.1 kHz. Do not
+            // reuse an AirPlay 48 kHz preference and make the receiver reject its MIME profile.
+            AudioStreamFormat selectedFormat = dlnaTarget
+                    ? new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE)
+                    : selectTransportFormat(txt, parseAudioQuality(intent));
             boolean mediaSessionAvailable = startMetadata(generation);
             if (stopIfStale(generation)) {
                 return;
             }
-            DacpSession remoteControl = mediaSessionAvailable
-                    ? startDacpSession(generation, host)
-                    : null;
+            if (dlnaTarget) {
+                DlnaStreamingClient client = createDlnaClient(
+                        host, sessionReceiverName, txt, selectedFormat, generation);
+                dlnaClient = client;
+                client.start();
+            } else {
+                DacpSession remoteControl = mediaSessionAvailable
+                        ? startDacpSession(generation, host)
+                        : null;
+                if (stopIfStale(generation)) {
+                    return;
+                }
+                RaopStreamingClient client = remoteControl == null
+                        ? new RaopStreamingClient(host, port, txt, selectedFormat)
+                        : new RaopStreamingClient(
+                                host,
+                                port,
+                                txt,
+                                remoteControl.dacpId(),
+                                remoteControl.activeRemote(),
+                                selectedFormat);
+                configureMetadata(client);
+                client.connect();
+                raopClient = client;
+            }
             if (stopIfStale(generation)) {
                 return;
             }
-            RaopStreamingClient client = remoteControl == null
-                    ? new RaopStreamingClient(host, port, txt)
-                    : new RaopStreamingClient(
-                            host,
-                            port,
-                            txt,
-                            remoteControl.dacpId(),
-                            remoteControl.activeRemote());
-            configureMetadata(client);
-            client.connect();
-            raopClient = client;
-            if (stopIfStale(generation)) {
-                return;
+            activeFormat = selectedFormat;
+            activeReceiverName = sessionReceiverName;
+            activeMuteDevice = intent.getBooleanExtra(EXTRA_MUTE_DEVICE, false);
+            awaitingCapture = true;
+            broadcastStatus(
+                    STATUS_AWAITING_CAPTURE,
+                    getString(R.string.status_receiver_connected));
+        } catch (Throwable error) {
+            if (sessionGeneration.compareAndSet(generation, generation + 1)) {
+                broadcastStatus(STATUS_ERROR, readableError(error));
+                stopSession(true, false);
+            } else {
+                stopSession(false);
             }
+        }
+    }
 
-            Intent projectionData = getProjectionData(intent);
-            int resultCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT, 0);
-            MediaProjectionManager manager =
-                    (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-            MediaProjection projection = manager.getMediaProjection(resultCode, projectionData);
-            if (projection == null) {
-                throw new IllegalStateException("未获得系统音频捕获授权");
-            }
-            mediaProjection = projection;
-
-            PlaybackCapture capture = new PlaybackCapture(
-                    projection,
-                    (buffer, byteCount, framePosition) -> writePcm(buffer, byteCount),
-                    new CaptureListener(generation));
-            playbackCapture = capture;
-            if (!capture.start()) {
-                throw new IllegalStateException("无法启动系统播放音频捕获");
-            }
+    private void attachPlaybackCapture(Intent intent, int generation) {
+        if (!isCurrentGeneration(generation) || stopping.get()) {
+            return;
+        }
+        AudioStreamFormat format = activeFormat;
+        if (!awaitingCapture || format == null || (raopClient == null && dlnaClient == null)) {
+            broadcastStatus(STATUS_ERROR, getString(R.string.capture_session_missing));
+            stopSession(true, false);
+            return;
+        }
+        try {
+            broadcastStatus(STATUS_CONNECTING, getString(R.string.status_starting_capture));
+            startPlaybackCapture(intent, generation, format);
             if (stopIfStale(generation)) {
                 return;
             }
-            broadcastStatus(STATUS_STREAMING, "正在投送到 " + sessionReceiverName);
-            applyDeviceMute(intent);
+            awaitingCapture = false;
+            broadcastStatus(
+                    STATUS_STREAMING,
+                    getString(R.string.status_streaming_receiver, activeReceiverName));
+            applyDeviceMute(activeMuteDevice);
         } catch (Throwable error) {
             if (sessionGeneration.compareAndSet(generation, generation + 1)) {
                 broadcastStatus(STATUS_ERROR, readableError(error));
@@ -247,6 +318,117 @@ public final class StreamingService extends Service {
         return sessionGeneration.get() == generation;
     }
 
+    private void startPlaybackCapture(
+            Intent intent, int generation, AudioStreamFormat selectedFormat) {
+        Intent projectionData = getProjectionData(intent);
+        int resultCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT, 0);
+        MediaProjectionManager manager =
+                (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        MediaProjection projection = manager.getMediaProjection(resultCode, projectionData);
+        if (projection == null) {
+            throw new IllegalStateException("未获得系统音频捕获授权");
+        }
+        mediaProjection = projection;
+
+        PlaybackCapture capture = new PlaybackCapture(
+                projection,
+                (buffer, byteCount, framePosition) -> writePcm(buffer, byteCount),
+                new CaptureListener(generation),
+                selectedFormat);
+        playbackCapture = capture;
+        if (!capture.start()) {
+            throw new IllegalStateException("无法启动系统播放音频捕获");
+        }
+    }
+
+    private static AudioStreamFormat selectTransportFormat(
+            Map<String, byte[]> txt,
+            AppPreferences.AudioQuality quality) {
+        AudioStreamFormat pcm44 = new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE);
+        AudioStreamFormat pcm48 = new AudioStreamFormat(48_000, 2, SampleFormat.PCM16_LE);
+        ReceiverCapabilities capabilities = ReceiverCapabilities.fromTxt(txt);
+        if (quality == AppPreferences.AudioQuality.PCM16_44_1) {
+            return chooseRequestedOrFallback(pcm44, pcm48, capabilities);
+        }
+        if (quality == AppPreferences.AudioQuality.PCM16_48) {
+            return chooseRequestedOrFallback(pcm48, pcm44, capabilities);
+        }
+        AudioStreamFormat selected = FormatNegotiator.choose(
+                Arrays.asList(pcm44, pcm48), capabilities);
+        // Missing TXT format fields mean unknown rather than refusal; preserve the
+        // long-standing 44.1 kHz default in that case.
+        return selected == null ? pcm44 : selected;
+    }
+
+    private static AudioStreamFormat chooseRequestedOrFallback(
+            AudioStreamFormat requested,
+            AudioStreamFormat fallback,
+            ReceiverCapabilities capabilities) {
+        // A manually selected rate is a preference, not permission to violate the
+        // receiver's advertised RAOP capabilities. Older receivers commonly expose
+        // only 44.1 kHz; keep the session usable instead of failing during ANNOUNCE.
+        if (capabilities.supports(requested)) {
+            return requested;
+        }
+        if (capabilities.supports(fallback)) {
+            return fallback;
+        }
+        // Empty/unknown TXT fields are treated as unknown by ReceiverCapabilities.
+        // Let the RAOP client perform its normal compatibility check in that case.
+        return requested;
+    }
+
+    private static AppPreferences.AudioQuality parseAudioQuality(Intent intent) {
+        String value = intent.getStringExtra(EXTRA_AUDIO_QUALITY);
+        if (value == null) {
+            return AppPreferences.AudioQuality.AUTO;
+        }
+        try {
+            return AppPreferences.AudioQuality.valueOf(value);
+        } catch (IllegalArgumentException exception) {
+            return AppPreferences.AudioQuality.AUTO;
+        }
+    }
+
+    private static boolean isDlnaTarget(Map<String, byte[]> attributes) {
+        byte[] value = attributes.get("transport");
+        return value != null && "dlna".equalsIgnoreCase(new String(value, java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private DlnaStreamingClient createDlnaClient(
+            InetAddress host,
+            String receiverName,
+            Map<String, byte[]> attributes,
+            AudioStreamFormat format,
+            int generation) {
+        String controlUrl = requiredDlnaAttribute(attributes, "dlna_av_transport_url");
+        String serviceType = requiredDlnaAttribute(attributes, "dlna_av_transport_type");
+        URI descriptionUri = URI.create("http://" + host.getHostAddress() + "/");
+        DlnaRendererDescription renderer = new DlnaRendererDescription(
+                receiverName,
+                receiverName,
+                descriptionUri,
+                URI.create(controlUrl),
+                serviceType,
+                null,
+                "",
+                null);
+        return new DlnaStreamingClient(
+                host,
+                renderer,
+                format,
+                playing -> worker.execute(
+                        () -> dispatchDlnaPlaybackRequest(generation, playing)));
+    }
+
+    private static String requiredDlnaAttribute(Map<String, byte[]> attributes, String key) {
+        byte[] value = attributes.get(key);
+        if (value == null || value.length == 0) {
+            throw new IllegalArgumentException("DLNA 接收器缺少 " + key);
+        }
+        return new String(value, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
     private boolean stopIfStale(int generation) {
         if (isCurrentGeneration(generation)) {
             return false;
@@ -256,6 +438,13 @@ public final class StreamingService extends Service {
     }
 
     private void writePcm(byte[] buffer, int byteCount) {
+        DlnaStreamingClient dlna = dlnaClient;
+        if (dlna != null) {
+            if (!stopping.get() && dlna == dlnaClient && playbackFlowGate.shouldForwardPcm()) {
+                dlna.writePcm(buffer, 0, byteCount);
+            }
+            return;
+        }
         RaopStreamingClient client = raopClient;
         if (client == null || stopping.get()) {
             return;
@@ -314,16 +503,25 @@ public final class StreamingService extends Service {
                 // Best-effort transport freeze; metadata still continues.
             }
         }
+        DlnaStreamingClient connectedDlna = dlnaClient;
+        if (connectedDlna != null && transition != PlaybackFlowGate.Transition.NONE) {
+            worker.execute(() -> {
+                try {
+                    if (transition == PlaybackFlowGate.Transition.PAUSED) {
+                        connectedDlna.pause();
+                    } else if (transition == PlaybackFlowGate.Transition.RESUMED) {
+                        connectedDlna.resume();
+                    }
+                } catch (IOException ignored) {
+                    // Some DLNA renderers do not implement PAUSE reliably. PCM gating still applies.
+                }
+            });
+        }
         // Scaling and JPEG compression run here, on the metadata thread — never
         // on the capture thread or the main thread.
         byte[] artworkJpeg = encodeArtwork(artwork);
         PendingMetadata pending = new PendingMetadata(track, artworkJpeg, transition, revision);
-        worker.execute(() -> {
-            RaopStreamingClient client = raopClient;
-            if (client != null) {
-                sendPendingMetadata(generation, client, pending);
-            }
-        });
+        worker.execute(() -> sendPendingMetadata(generation, pending));
     }
 
     private DacpSession startDacpSession(int generation, InetAddress host) {
@@ -367,6 +565,21 @@ public final class StreamingService extends Service {
         }
     }
 
+    private void dispatchDlnaPlaybackRequest(int generation, boolean playing) {
+        if (!isCurrentGeneration(generation) || stopping.get() || dlnaClient == null) {
+            return;
+        }
+        MediaSessionMonitor monitor = metadataMonitor;
+        if (monitor == null) {
+            return;
+        }
+        if (playing) {
+            monitor.requestPlay();
+        } else {
+            monitor.requestPause();
+        }
+    }
+
     private static MetadataSendPolicy policyFor(MetadataSupport support) {
         if (support == MetadataSupport.NOT_ADVERTISED) {
             return null;
@@ -376,17 +589,37 @@ public final class StreamingService extends Service {
                 : MetadataSendPolicy.Mode.UNKNOWN);
     }
 
-    private void sendPendingMetadata(int generation, RaopStreamingClient client, PendingMetadata pending) {
-        if (pending == null || !isCurrentGeneration(generation) || client != raopClient) {
+    private void sendPendingMetadata(int generation, PendingMetadata pending) {
+        if (pending == null || !isCurrentGeneration(generation)) {
             return;
         }
         if (pending.transition == PlaybackFlowGate.Transition.PAUSED
                 && pending.revision != playbackFlowGate.revision()) {
             return;
         }
-        sendTextMetadata(client, pending.track);
-        sendArtworkMetadata(client, pending.artworkJpeg);
-        sendProgressMetadata(client, pending.track);
+        RaopStreamingClient raop = raopClient;
+        if (raop != null) {
+            sendTextMetadata(raop, pending.track);
+            sendArtworkMetadata(raop, pending.artworkJpeg);
+            sendProgressMetadata(raop, pending.track);
+        }
+        DlnaStreamingClient dlna = dlnaClient;
+        TrackMetadata track = pending.track;
+        if (dlna != null && track != null && !track.isEmpty()) {
+            try {
+                dlna.updateMetadata(
+                        track.getTitle(),
+                        track.getArtist(),
+                        track.getAlbum(),
+                        track.dedupKey(),
+                        track.getDurationMs(),
+                        track.getPositionMs(),
+                        pending.artworkJpeg,
+                        track.isPlaying());
+            } catch (IOException | RuntimeException ignored) {
+                // Metadata is optional; an incompatible renderer must not stop live audio.
+            }
+        }
     }
 
     private void sendTextMetadata(RaopStreamingClient client, TrackMetadata track) {
@@ -423,6 +656,7 @@ public final class StreamingService extends Service {
                 progressPolicy,
                 track,
                 client.currentRtpTimestamp(),
+                client.sampleRateHz(),
                 client::sendProgress);
     }
 
@@ -487,8 +721,8 @@ public final class StreamingService extends Service {
      * session is up and restores the previous volume on stop, unless the user picked a
      * new volume in the meantime. Capture duplicates the mix, so the receiver is unaffected.
      */
-    private void applyDeviceMute(Intent intent) {
-        if (!intent.getBooleanExtra(EXTRA_MUTE_DEVICE, false)) {
+    private void applyDeviceMute(boolean enabled) {
+        if (!enabled) {
             return;
         }
         AudioManager audioManager = getSystemService(AudioManager.class);
@@ -516,6 +750,11 @@ public final class StreamingService extends Service {
         if (!stopping.compareAndSet(false, true) && !stopService) {
             return;
         }
+
+        awaitingCapture = false;
+        activeFormat = null;
+        activeReceiverName = "";
+        activeMuteDevice = false;
 
         DacpSession remoteControl = dacpSession;
         dacpSession = null;
@@ -547,6 +786,11 @@ public final class StreamingService extends Service {
                 // The receiver may already have closed the session.
             }
         }
+        DlnaStreamingClient dlna = dlnaClient;
+        dlnaClient = null;
+        if (dlna != null) {
+            dlna.close();
+        }
         releaseNetworkLocks();
 
         if (stopService) {
@@ -560,11 +804,16 @@ public final class StreamingService extends Service {
 
     private void startInForeground(String deviceName) {
         getSystemService(NotificationManager.class).cancel(ERROR_NOTIFICATION_ID);
-        Notification notification = buildNotification("正在连接 " + deviceName + "…");
+        String message = getString(R.string.status_connecting_receiver, deviceName);
+        // Publish the state before the session worker runs. If the user switches back
+        // immediately, MainActivity must not mistake this session for an idle one and
+        // restart discovery while the TV connection is being negotiated.
+        lastStatus = new StatusSnapshot(STATUS_CONNECTING, message, activeReceiverKey);
+        Notification notification = buildNotification(message);
         startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
     }
 
     private Notification buildNotification(String text) {
@@ -659,8 +908,14 @@ public final class StreamingService extends Service {
 
     @SuppressLint("MissingPermission")
     private void broadcastStatus(String status, String message) {
-        lastStatus = new StatusSnapshot(status, message);
-        if (STATUS_CONNECTING.equals(status) || STATUS_STREAMING.equals(status)) {
+        if (STATUS_STOPPED.equals(status) || STATUS_ERROR.equals(status)) {
+            activeReceiverKey = "";
+        }
+        lastStatus = new StatusSnapshot(status, message, activeReceiverKey);
+        if (STATUS_CONNECTING.equals(status)
+                || STATUS_STOPPING.equals(status)
+                || STATUS_AWAITING_CAPTURE.equals(status)
+                || STATUS_STREAMING.equals(status)) {
             NotificationManager notificationManager = getSystemService(NotificationManager.class);
             if (notificationManager != null) {
                 notificationManager.notify(NOTIFICATION_ID, buildNotification(message));
@@ -674,7 +929,8 @@ public final class StreamingService extends Service {
         Intent update = new Intent(ACTION_STATUS)
                 .setPackage(getPackageName())
                 .putExtra(EXTRA_STATUS, status)
-                .putExtra(EXTRA_MESSAGE, message);
+                .putExtra(EXTRA_MESSAGE, message)
+                .putExtra(EXTRA_RECEIVER_KEY, activeReceiverKey);
         sendBroadcast(update);
     }
 
@@ -737,8 +993,12 @@ public final class StreamingService extends Service {
         stopSession(false);
         worker.shutdownNow();
         StatusSnapshot status = lastStatus;
-        if (STATUS_CONNECTING.equals(status.status) || STATUS_STREAMING.equals(status.status)) {
-            lastStatus = new StatusSnapshot(STATUS_STOPPED, "投送服务已结束");
+        if (STATUS_CONNECTING.equals(status.status)
+                || STATUS_STOPPING.equals(status.status)
+                || STATUS_AWAITING_CAPTURE.equals(status.status)
+                || STATUS_STREAMING.equals(status.status)) {
+            activeReceiverKey = "";
+            lastStatus = new StatusSnapshot(STATUS_STOPPED, "投送服务已结束", "");
         }
         super.onDestroy();
     }
@@ -772,10 +1032,12 @@ public final class StreamingService extends Service {
     public static final class StatusSnapshot {
         private final String status;
         private final String message;
+        private final String receiverKey;
 
-        private StatusSnapshot(String status, String message) {
+        private StatusSnapshot(String status, String message, String receiverKey) {
             this.status = status;
             this.message = message;
+            this.receiverKey = receiverKey;
         }
 
         public String getStatus() {
@@ -784,6 +1046,10 @@ public final class StreamingService extends Service {
 
         public String getMessage() {
             return message;
+        }
+
+        public String getReceiverKey() {
+            return receiverKey;
         }
     }
 }

@@ -1,8 +1,8 @@
 package app.shengdu.audio.raop;
 
 /**
- * Computes the RAOP {@code progress: start/curr/end} triple (RTP timestamp ticks at
- * 44.1 kHz, unsigned 32-bit with wraparound) from an Android MediaSession position.
+ * Computes the RAOP {@code progress: start/curr/end} triple (RTP timestamp ticks at the
+ * negotiated sample rate, unsigned 32-bit with wraparound) from an Android MediaSession position.
  *
  * The anchor maps "now" onto the live audio stream: {@code curr} is the stream's current
  * RTP timestamp, {@code start} is the timestamp the track began at (curr minus elapsed
@@ -21,11 +21,19 @@ public final class RtpProgress {
 
     /** Returns {start, curr, end} as unsigned 32-bit RTP timestamps. */
     public static long[] compute(long positionMs, long durationMs, long rtpTimestampNow) {
+        return compute(positionMs, durationMs, rtpTimestampNow, TICKS_PER_SECOND);
+    }
+
+    public static long[] compute(
+            long positionMs, long durationMs, long rtpTimestampNow, int ticksPerSecond) {
         if (positionMs < 0 || durationMs < 0) {
             throw new IllegalArgumentException("positionMs and durationMs must be >= 0");
         }
-        long positionTicks = positionMs * TICKS_PER_SECOND / 1000;
-        long durationTicks = durationMs * TICKS_PER_SECOND / 1000;
+        if (ticksPerSecond <= 0) {
+            throw new IllegalArgumentException("ticksPerSecond must be positive");
+        }
+        long positionTicks = positionMs * ticksPerSecond / 1000;
+        long durationTicks = durationMs * ticksPerSecond / 1000;
         long curr = rtpTimestampNow & 0xffffffffL;
         long start = (curr - positionTicks) & 0xffffffffL;
         long end = (start + durationTicks) & 0xffffffffL;

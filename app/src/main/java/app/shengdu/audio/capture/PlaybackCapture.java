@@ -9,8 +9,11 @@ import android.media.projection.MediaProjection;
 import android.os.Handler;
 import android.os.HandlerThread;
 
+import app.shengdu.audio.format.AudioStreamFormat;
+import app.shengdu.audio.format.SampleFormat;
+
 /**
- * Captures system playback audio as 44.1 kHz stereo PCM16 using a supplied {@link MediaProjection}.
+ * Captures system playback audio as interleaved PCM16 using a supplied {@link MediaProjection}.
  */
 public final class PlaybackCapture {
     public static final int SAMPLE_RATE_HZ = 44_100;
@@ -18,16 +21,14 @@ public final class PlaybackCapture {
     public static final int BYTES_PER_SAMPLE = 2;
     public static final int FRAMES_PER_READ = 1_024;
 
-    private static final AudioFormat AUDIO_FORMAT = new AudioFormat.Builder()
-            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .setSampleRate(SAMPLE_RATE_HZ)
-            .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-            .build();
+    public static final AudioStreamFormat DEFAULT_FORMAT =
+            new AudioStreamFormat(SAMPLE_RATE_HZ, CHANNEL_COUNT, SampleFormat.PCM16_LE);
 
     private final Object stateLock = new Object();
     private final MediaProjection mediaProjection;
     private final PcmSink pcmSink;
     private final Listener listener;
+    private final AudioStreamFormat requestedFormat;
     private final MediaProjection.Callback projectionCallback = new ProjectionStopCallback();
 
     private volatile boolean stopRequested;
@@ -39,15 +40,33 @@ public final class PlaybackCapture {
     private Thread captureThread;
 
     public PlaybackCapture(MediaProjection mediaProjection, PcmSink pcmSink, Listener listener) {
+        this(mediaProjection, pcmSink, listener, DEFAULT_FORMAT);
+    }
+
+    public PlaybackCapture(
+            MediaProjection mediaProjection,
+            PcmSink pcmSink,
+            Listener listener,
+            AudioStreamFormat requestedFormat) {
         if (mediaProjection == null) {
             throw new IllegalArgumentException("mediaProjection == null");
         }
         if (pcmSink == null) {
             throw new IllegalArgumentException("pcmSink == null");
         }
+        if (requestedFormat == null
+                || requestedFormat.channelCount() != CHANNEL_COUNT
+                || requestedFormat.sampleFormat() != SampleFormat.PCM16_LE) {
+            throw new IllegalArgumentException("Playback capture currently supports PCM16 stereo only");
+        }
         this.mediaProjection = mediaProjection;
         this.pcmSink = pcmSink;
         this.listener = listener;
+        this.requestedFormat = requestedFormat;
+    }
+
+    public AudioStreamFormat requestedFormat() {
+        return requestedFormat;
     }
 
     public State getState() {
@@ -151,21 +170,26 @@ public final class PlaybackCapture {
                         .build();
 
         int minBufferBytes = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE_HZ,
+                requestedFormat.sampleRateHz(),
                 AudioFormat.CHANNEL_IN_STEREO,
                 AudioFormat.ENCODING_PCM_16BIT);
         if (minBufferBytes <= 0) {
             throw new IllegalStateException("AudioRecord min buffer query failed: " + minBufferBytes);
         }
 
-        int frameBytes = CaptureBufferSizer.bytesPerFrame(CHANNEL_COUNT, BYTES_PER_SAMPLE);
+        int frameBytes = requestedFormat.bytesPerFrame();
         int internalBufferBytes = CaptureBufferSizer.internalBufferBytes(
                 minBufferBytes,
                 frameBytes,
                 FRAMES_PER_READ);
 
+        AudioFormat audioFormat = new AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(requestedFormat.sampleRateHz())
+                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                .build();
         AudioRecord record = new AudioRecord.Builder()
-                .setAudioFormat(AUDIO_FORMAT)
+                .setAudioFormat(audioFormat)
                 .setBufferSizeInBytes(internalBufferBytes)
                 .setAudioPlaybackCaptureConfig(captureConfiguration)
                 .build();
@@ -178,15 +202,15 @@ public final class PlaybackCapture {
         return record;
     }
 
-    private static void validateAudioRecordFormat(AudioRecord record) {
+    private void validateAudioRecordFormat(AudioRecord record) {
         int encoding = record.getAudioFormat();
         int sampleRate = record.getSampleRate();
         int channelCount = record.getChannelCount();
         int frameSize = record.getFormat().getFrameSizeInBytes();
-        int expectedFrameSize = CHANNEL_COUNT * BYTES_PER_SAMPLE;
+        int expectedFrameSize = requestedFormat.bytesPerFrame();
         if (encoding != AudioFormat.ENCODING_PCM_16BIT
-                || sampleRate != SAMPLE_RATE_HZ
-                || channelCount != CHANNEL_COUNT
+                || sampleRate != requestedFormat.sampleRateHz()
+                || channelCount != requestedFormat.channelCount()
                 || frameSize != expectedFrameSize) {
             record.release();
             throw new IllegalStateException(
@@ -309,8 +333,8 @@ public final class PlaybackCapture {
 
         @Override
         public void run() {
-            int frameBytes = CaptureBufferSizer.bytesPerFrame(CHANNEL_COUNT, BYTES_PER_SAMPLE);
-            short[] sampleBuffer = new short[FRAMES_PER_READ * CHANNEL_COUNT];
+            int frameBytes = requestedFormat.bytesPerFrame();
+            short[] sampleBuffer = new short[FRAMES_PER_READ * requestedFormat.channelCount()];
             byte[] pcm16LeBuffer = new byte[CaptureBufferSizer.readBufferBytes(frameBytes, FRAMES_PER_READ)];
             long framePosition = 0L;
             try {
@@ -321,7 +345,7 @@ public final class PlaybackCapture {
                             sampleBuffer.length,
                             AudioRecord.READ_BLOCKING);
                     if (samplesRead > 0) {
-                        if (samplesRead % CHANNEL_COUNT != 0) {
+                        if (samplesRead % requestedFormat.channelCount() != 0) {
                             throw new IllegalStateException(
                                     "AudioRecord returned a partial PCM frame: " + samplesRead + " samples");
                         }
@@ -330,7 +354,7 @@ public final class PlaybackCapture {
                                 samplesRead,
                                 pcm16LeBuffer);
                         pcmSink.onPcmFrame(pcm16LeBuffer, bytesRead, framePosition);
-                        framePosition += samplesRead / CHANNEL_COUNT;
+                        framePosition += samplesRead / requestedFormat.channelCount();
                         continue;
                     }
                     if (samplesRead == 0 && stopRequested) {

@@ -29,3 +29,6 @@ jobs:
 
       - name: Verify Android project
         run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+
+      - name: Assemble release APK (unsigned without signing configuration)
+        run: ./gradlew --no-daemon --stacktrace :app:assembleRelease

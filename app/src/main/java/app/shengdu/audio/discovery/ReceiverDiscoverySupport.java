@@ -24,6 +24,7 @@ import java.util.Set;
 final class ReceiverDiscoverySupport {
     static final String SERVICE_TYPE_RAOP = "_raop._tcp.";
     static final String SERVICE_TYPE_AIRPLAY = "_airplay._tcp.";
+    static final String SERVICE_TYPE_DLNA = "urn:schemas-upnp-org:device:MediaRenderer:1";
     static final List<String> RAOP_COMPATIBILITY_KEYS =
             List.of("tp", "cn", "sr", "ss", "ch", "et");
 

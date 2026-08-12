@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 package app.shengdu.audio.raop;
 
+import app.shengdu.audio.format.AudioStreamFormat;
+import app.shengdu.audio.format.SampleFormat;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -24,6 +27,8 @@ import java.util.Map;
 import java.util.Set;
 
 public final class RaopStreamingClient implements Closeable {
+    private static final AudioStreamFormat DEFAULT_FORMAT =
+            new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE);
     private static final String TRANSPORT_TCP = "RTP/AVP/TCP;unicast;interleaved=0-1;mode=record";
     private static final String TRANSPORT_UDP_PREFIX =
             "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=";
@@ -40,13 +45,22 @@ public final class RaopStreamingClient implements Closeable {
     private final SecureRandom random;
     private final String dacpId;
     private final String activeRemote;
+    private final AudioStreamFormat format;
     private final byte[] partialPcm = new byte[AlacPacketBuilder.PCM_BYTES_PER_TCP_PACKET];
 
     private int partialPcmLength;
     private Session session;
 
     public RaopStreamingClient(InetAddress host, int port, Map<String, byte[]> txtAttributes) {
-        this(host, port, txtAttributes, new SecureRandom(), null, null);
+        this(host, port, txtAttributes, new SecureRandom(), null, null, DEFAULT_FORMAT);
+    }
+
+    public RaopStreamingClient(
+            InetAddress host,
+            int port,
+            Map<String, byte[]> txtAttributes,
+            AudioStreamFormat format) {
+        this(host, port, txtAttributes, new SecureRandom(), null, null, format);
     }
 
     public RaopStreamingClient(
@@ -55,7 +69,17 @@ public final class RaopStreamingClient implements Closeable {
             Map<String, byte[]> txtAttributes,
             String dacpId,
             String activeRemote) {
-        this(host, port, txtAttributes, new SecureRandom(), dacpId, activeRemote);
+        this(host, port, txtAttributes, new SecureRandom(), dacpId, activeRemote, DEFAULT_FORMAT);
+    }
+
+    public RaopStreamingClient(
+            InetAddress host,
+            int port,
+            Map<String, byte[]> txtAttributes,
+            String dacpId,
+            String activeRemote,
+            AudioStreamFormat format) {
+        this(host, port, txtAttributes, new SecureRandom(), dacpId, activeRemote, format);
     }
 
     RaopStreamingClient(
@@ -63,7 +87,7 @@ public final class RaopStreamingClient implements Closeable {
             int port,
             Map<String, byte[]> txtAttributes,
             SecureRandom random) {
-        this(host, port, txtAttributes, random, null, null);
+        this(host, port, txtAttributes, random, null, null, DEFAULT_FORMAT);
     }
 
     RaopStreamingClient(
@@ -73,9 +97,24 @@ public final class RaopStreamingClient implements Closeable {
             SecureRandom random,
             String dacpId,
             String activeRemote) {
+        this(host, port, txtAttributes, random, dacpId, activeRemote, DEFAULT_FORMAT);
+    }
+
+    RaopStreamingClient(
+            InetAddress host,
+            int port,
+            Map<String, byte[]> txtAttributes,
+            SecureRandom random,
+            String dacpId,
+            String activeRemote,
+            AudioStreamFormat format) {
         this.host = host;
         this.port = port;
-        this.txtInfo = TxtInfo.from(txtAttributes);
+        if (format == null || format.channelCount() != 2 || format.sampleFormat() != SampleFormat.PCM16_LE) {
+            throw new IllegalArgumentException("RAOP currently supports PCM16 stereo only");
+        }
+        this.format = format;
+        this.txtInfo = TxtInfo.from(txtAttributes, format);
         this.random = random;
         validateDacpCredentials(dacpId, activeRemote);
         this.dacpId = dacpId;
@@ -119,6 +158,10 @@ public final class RaopStreamingClient implements Closeable {
     public synchronized long currentRtpTimestamp() {
         Session current = session;
         return current == null ? 0 : current.timestamp;
+    }
+
+    public int sampleRateHz() {
+        return format.sampleRateHz();
     }
 
     /**
@@ -229,7 +272,8 @@ public final class RaopStreamingClient implements Closeable {
                         crypto,
                         initialSequence,
                         initialTimestamp,
-                        ssrc);
+                        ssrc,
+                        format);
             } else {
                 String setupTransport = setup.header("transport");
                 int audioPort = parseRequiredPort(setupTransport, "server_port", "legacy RAOP UDP server_port");
@@ -251,7 +295,8 @@ public final class RaopStreamingClient implements Closeable {
                         ssrc,
                         udpAudioSocket,
                         udpControlSocket,
-                        udpTimingSocket);
+                        udpTimingSocket,
+                        format);
                 sendDatagram(udpTimingSocket, RtpPacketizer.buildInitialUdpTimingPacket());
             }
 
@@ -356,7 +401,7 @@ public final class RaopStreamingClient implements Closeable {
 
         try {
             byte[] payload = AlacPacketBuilder.encodeUncompressedFrames(
-                    pcm, offset, current.pcmBytesPerPacket);
+                    current.format, pcm, offset, current.pcmBytesPerPacket);
             if (current.transport == TransportMode.TCP) {
                 byte[] packet = RtpPacketizer.buildTcpPacket(
                         current.sequenceNumber,
@@ -432,7 +477,13 @@ public final class RaopStreamingClient implements Closeable {
         sdp.append("a=rtpmap:96 AppleLossless\r\n");
         sdp.append("a=fmtp:96 ")
                 .append(txtInfo.transport.framesPerPacket)
-                .append(" 0 16 40 10 14 2 255 0 0 44100\r\n");
+                .append(" 0 ")
+                .append(format.sampleFormat().bitsPerSample())
+                .append(" 40 10 14 ")
+                .append(format.channelCount())
+                .append(" 255 0 0 ")
+                .append(format.sampleRateHz())
+                .append("\r\n");
         if (crypto != null) {
             sdp.append("a=rsaaeskey:").append(crypto.encryptedKeyBase64(random)).append("\r\n");
             sdp.append("a=aesiv:").append(crypto.aesIvBase64()).append("\r\n");
@@ -620,7 +671,10 @@ public final class RaopStreamingClient implements Closeable {
         if (session.firstPacket || session.udpSyncCount >= session.udpSyncInterval) {
             sendDatagram(
                     session.udpControlSocket,
-                    RtpPacketizer.buildUdpSyncPacket(session.timestamp, session.firstPacket));
+                    RtpPacketizer.buildUdpSyncPacket(
+                            session.timestamp,
+                            session.firstPacket,
+                            session.format.sampleRateHz()));
             session.udpSyncCount = 0;
         }
     }
@@ -762,6 +816,10 @@ public final class RaopStreamingClient implements Closeable {
         }
 
         static TxtInfo from(Map<String, byte[]> txt) {
+            return from(txt, DEFAULT_FORMAT);
+        }
+
+        static TxtInfo from(Map<String, byte[]> txt, AudioStreamFormat format) {
             if (txt == null) {
                 return supported(
                         RaopCompatibility.LEGACY_CLEAR,
@@ -793,15 +851,21 @@ public final class RaopStreamingClient implements Closeable {
             if (capabilityFailure != null) {
                 return capabilityFailure;
             }
-            capabilityFailure = requireCapability(txt, "sr", "44100 Hz sample rate", token -> "44100".equals(token));
+            String sampleRate = Integer.toString(format.sampleRateHz());
+            String sampleSize = Integer.toString(format.sampleFormat().bitsPerSample());
+            String channels = Integer.toString(format.channelCount());
+            capabilityFailure = requireCapability(
+                    txt, "sr", sampleRate + " Hz sample rate", sampleRate::equals);
             if (capabilityFailure != null) {
                 return capabilityFailure;
             }
-            capabilityFailure = requireCapability(txt, "ss", "16-bit audio", token -> "16".equals(token));
+            capabilityFailure = requireCapability(
+                    txt, "ss", sampleSize + "-bit audio", sampleSize::equals);
             if (capabilityFailure != null) {
                 return capabilityFailure;
             }
-            capabilityFailure = requireCapability(txt, "ch", "2-channel audio", token -> "2".equals(token));
+            capabilityFailure = requireCapability(
+                    txt, "ch", channels + "-channel audio", channels::equals);
             if (capabilityFailure != null) {
                 return capabilityFailure;
             }
@@ -956,6 +1020,7 @@ public final class RaopStreamingClient implements Closeable {
         final String uri;
         final String sessionId;
         final RaopCrypto crypto;
+        final AudioStreamFormat format;
         final int framesPerPacket;
         final int pcmBytesPerPacket;
         final int udpSyncInterval;
@@ -984,7 +1049,8 @@ public final class RaopStreamingClient implements Closeable {
                 int sequenceNumber,
                 long timestamp,
                 long ssrc,
-                int framesPerPacket) {
+                int framesPerPacket,
+                AudioStreamFormat format) {
             this.transport = transport;
             this.rtsp = rtsp;
             this.audioSocket = audioSocket;
@@ -995,12 +1061,13 @@ public final class RaopStreamingClient implements Closeable {
             this.uri = uri;
             this.sessionId = sessionId;
             this.crypto = crypto;
+            this.format = format;
             this.sequenceNumber = sequenceNumber;
             this.timestamp = timestamp;
             this.ssrc = ssrc;
             this.framesPerPacket = framesPerPacket;
-            this.pcmBytesPerPacket = framesPerPacket * AlacPacketBuilder.PCM_BYTES_PER_FRAME;
-            this.udpSyncInterval = Math.max(1, 44_100 / framesPerPacket);
+            this.pcmBytesPerPacket = framesPerPacket * format.bytesPerFrame();
+            this.udpSyncInterval = Math.max(1, format.sampleRateHz() / framesPerPacket);
             this.retransmitCache = transport == TransportMode.UDP
                     ? new UdpRetransmitCache(UDP_RETRANSMIT_CACHE_PACKETS)
                     : null;
@@ -1016,7 +1083,8 @@ public final class RaopStreamingClient implements Closeable {
                 RaopCrypto crypto,
                 int sequenceNumber,
                 long timestamp,
-                long ssrc) {
+                long ssrc,
+                AudioStreamFormat format) {
             return new Session(
                     TransportMode.TCP,
                     rtsp,
@@ -1031,7 +1099,8 @@ public final class RaopStreamingClient implements Closeable {
                     sequenceNumber,
                     timestamp,
                     ssrc,
-                    TransportMode.TCP.framesPerPacket);
+                    TransportMode.TCP.framesPerPacket,
+                    format);
         }
 
         private static Session forUdp(
@@ -1044,7 +1113,8 @@ public final class RaopStreamingClient implements Closeable {
                 long ssrc,
                 DatagramSocket udpAudioSocket,
                 DatagramSocket udpControlSocket,
-                DatagramSocket udpTimingSocket) {
+                DatagramSocket udpTimingSocket,
+                AudioStreamFormat format) {
             return new Session(
                     TransportMode.UDP,
                     rtsp,
@@ -1059,7 +1129,8 @@ public final class RaopStreamingClient implements Closeable {
                     sequenceNumber,
                     timestamp,
                     ssrc,
-                    TransportMode.UDP.framesPerPacket);
+                    TransportMode.UDP.framesPerPacket,
+                    format);
         }
 
         private void stopUdpWorkers() {

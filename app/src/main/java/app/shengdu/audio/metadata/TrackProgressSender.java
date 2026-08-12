@@ -19,6 +19,15 @@ public final class TrackProgressSender {
             TrackMetadata track,
             long rtpTimestamp,
             Sink sink) {
+        send(policy, track, rtpTimestamp, RtpProgress.TICKS_PER_SECOND, sink);
+    }
+
+    public void send(
+            MetadataSendPolicy policy,
+            TrackMetadata track,
+            long rtpTimestamp,
+            int sampleRateHz,
+            Sink sink) {
         if (policy == null || track == null || track.getDurationMs() <= 0) {
             return;
         }
@@ -28,7 +37,7 @@ public final class TrackProgressSender {
         }
 
         long[] progress = RtpProgress.compute(
-                tracker.positionMsFor(track), track.getDurationMs(), rtpTimestamp);
+                tracker.positionMsFor(track), track.getDurationMs(), rtpTimestamp, sampleRateHz);
         try {
             Objects.requireNonNull(sink, "sink").send(
                     progress[RtpProgress.INDEX_START],

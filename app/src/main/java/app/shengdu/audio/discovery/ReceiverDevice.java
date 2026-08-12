@@ -79,6 +79,10 @@ public final class ReceiverDevice {
         return advertisedServiceTypes.contains(ReceiverDiscoverySupport.SERVICE_TYPE_AIRPLAY);
     }
 
+    public boolean supportsDlna() {
+        return advertisedServiceTypes.contains(ReceiverDiscoverySupport.SERVICE_TYPE_DLNA);
+    }
+
     public String getKey() {
         return getStableKey();
     }
