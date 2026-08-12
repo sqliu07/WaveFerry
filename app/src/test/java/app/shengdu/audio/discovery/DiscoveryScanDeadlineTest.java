@@ -19,15 +19,31 @@ public final class DiscoveryScanDeadlineTest {
     }
 
     @Test
-    public void findingADeviceCancelsTheDeadline() {
+    public void findingADeviceWaitsForBoundedDiscovery() {
         DiscoveryScanDeadline deadline = new DiscoveryScanDeadline();
 
         deadline.begin(false);
         deadline.onDevicesFound();
 
+        assertTrue(deadline.isArmed());
+        deadline.onBoundedScanFinished(true);
+
         assertFalse(deadline.isArmed());
         assertFalse(deadline.hasTimedOut());
         assertFalse(deadline.expire());
+    }
+
+    @Test
+    public void boundedDiscoveryCanFinishBeforeAirPlayFindsADevice() {
+        DiscoveryScanDeadline deadline = new DiscoveryScanDeadline();
+
+        deadline.begin(false);
+        deadline.onBoundedScanFinished(false);
+
+        assertTrue(deadline.isArmed());
+        deadline.onDevicesFound();
+
+        assertFalse(deadline.isArmed());
     }
 
     @Test

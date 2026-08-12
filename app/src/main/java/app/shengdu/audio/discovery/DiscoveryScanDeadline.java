@@ -1,18 +1,28 @@
 package app.shengdu.audio.discovery;
 
-/** Tracks whether an empty receiver scan is still waiting for its deadline. */
+/** Tracks one visible scan round across immediate AirPlay and bounded DLNA discovery. */
 public final class DiscoveryScanDeadline {
     private boolean armed;
+    private boolean boundedScanFinished;
     private boolean timedOut;
 
     public void begin(boolean hasDevices) {
         armed = !hasDevices;
+        boundedScanFinished = false;
         timedOut = false;
     }
 
     public void onDevicesFound() {
-        armed = false;
-        timedOut = false;
+        if (boundedScanFinished) {
+            complete();
+        }
+    }
+
+    public void onBoundedScanFinished(boolean hasDevices) {
+        boundedScanFinished = true;
+        if (hasDevices) {
+            complete();
+        }
     }
 
     public void cancel() {
@@ -34,5 +44,10 @@ public final class DiscoveryScanDeadline {
 
     public boolean hasTimedOut() {
         return timedOut;
+    }
+
+    private void complete() {
+        armed = false;
+        timedOut = false;
     }
 }

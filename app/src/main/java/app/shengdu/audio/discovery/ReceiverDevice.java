@@ -1,5 +1,6 @@
 package app.shengdu.audio.discovery;
 
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -7,7 +8,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-public final class ReceiverDevice {
+public final class ReceiverDevice implements Serializable {
+    private static final long serialVersionUID = 1L;
     private final String stableKey;
     private final String displayName;
     private final String serviceType;

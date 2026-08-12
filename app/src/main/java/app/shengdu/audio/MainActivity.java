@@ -64,7 +64,8 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
             applyStreamingStatus(
                     intent.getStringExtra(StreamingService.EXTRA_STATUS),
                     intent.getStringExtra(StreamingService.EXTRA_MESSAGE),
-                    intent.getStringExtra(StreamingService.EXTRA_RECEIVER_KEY));
+                    intent.getStringExtra(StreamingService.EXTRA_RECEIVER_KEY),
+                    receiverExtra(intent));
         }
     };
 
@@ -72,6 +73,7 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
     private DlnaDiscovery dlnaDiscovery;
     private AppPreferences preferences;
     private ReceiverDevice selectedReceiver;
+    private ReceiverDevice activeReceiverDevice;
     private MediaSessionMonitor nowPlayingMonitor;
     private HandlerThread nowPlayingThread;
     private int nowPlayingGeneration;
@@ -113,11 +115,17 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
                 for (DlnaRendererDescription renderer : renderers) {
                     dlnaDevices.add(toDlnaReceiver(renderer));
                 }
+                discoveryScanDeadline.onBoundedScanFinished(
+                        !airPlayDevices.isEmpty() || !dlnaDevices.isEmpty());
+                removeDiscoveryTimeoutIfComplete();
                 refreshReceiverList(discovery.isScanning() || dlnaDiscovery.isScanning());
             }
 
             @Override
             public void onError(String message) {
+                discoveryScanDeadline.onBoundedScanFinished(!airPlayDevices.isEmpty());
+                removeDiscoveryTimeoutIfComplete();
+                refreshReceiverList(discovery.isScanning());
                 if (devices.isEmpty() && !discoveryScanDeadline.isArmed()) {
                     setDiscoveryStatus(message, true);
                 }
@@ -374,11 +382,13 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
                     receiver.getPort(),
                     receiver.getDisplayName(),
                     receiver.getStableKey(),
+                    receiver,
                     encodeTxtAttributes(receiver.getTxtAttributes()),
                     preferences.isMuteDeviceEnabled(),
                     preferences.getAudioQuality());
             startForegroundService(serviceIntent);
             activeReceiverKey = receiver.getStableKey();
+            activeReceiverDevice = receiver;
             applyStreamingStatus(
                     StreamingService.STATUS_CONNECTING,
                     getString(R.string.status_connecting_receiver, receiver.getDisplayName()));
@@ -479,15 +489,18 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
         devices.clear();
         devices.addAll(airPlayDevices);
         devices.addAll(dlnaDevices);
+        if (isStreamingActive()) {
+            activeReceiverDevice = retainActiveReceiver(
+                    devices, activeReceiverKey, activeReceiverDevice);
+        }
         devices.sort((left, right) -> left.getDisplayName().compareToIgnoreCase(right.getDisplayName()));
         renderReceiverList(selectedKey);
         if (!devices.isEmpty() && discoveryScanDeadline.isArmed()) {
             discoveryScanDeadline.onDevicesFound();
-            discoveryTimeoutHandler.removeCallbacks(discoveryTimeout);
+            removeDiscoveryTimeoutIfComplete();
         }
-        boolean scanInProgress = devices.isEmpty()
-                && !discoveryScanDeadline.hasTimedOut()
-                && (discoveryScanDeadline.isArmed() || dlnaDiscovery.isScanning() || scanning);
+        boolean scanInProgress = discoveryScanDeadline.isArmed()
+                && !discoveryScanDeadline.hasTimedOut();
         scanButton.setEnabled(!scanInProgress);
         scanButton.setText(getString(scanInProgress ? R.string.scanning : R.string.scan));
         if (devices.isEmpty()) {
@@ -534,12 +547,25 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
         discoveryScanDeadline.cancel();
     }
 
+    private void removeDiscoveryTimeoutIfComplete() {
+        if (!discoveryScanDeadline.isArmed()) {
+            discoveryTimeoutHandler.removeCallbacks(discoveryTimeout);
+        }
+    }
+
     private void onDiscoveryTimeout() {
-        if (!activityStarted || !devices.isEmpty() || !discoveryScanDeadline.expire()) {
+        if (!activityStarted || !discoveryScanDeadline.isArmed()) {
             return;
         }
-        discovery.stop();
-        dlnaDiscovery.cancelScan();
+        if (devices.isEmpty()) {
+            if (!discoveryScanDeadline.expire()) {
+                return;
+            }
+            discovery.stop();
+            dlnaDiscovery.cancelScan();
+        } else {
+            discoveryScanDeadline.cancel();
+        }
         refreshReceiverList(false);
     }
 
@@ -624,6 +650,22 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
                 && !activeKey.equals(selectedKey);
     }
 
+    static ReceiverDevice retainActiveReceiver(
+            List<ReceiverDevice> available,
+            String activeKey,
+            ReceiverDevice activeDevice) {
+        if (activeDevice == null || activeKey == null || activeKey.isEmpty()) {
+            return activeDevice;
+        }
+        for (ReceiverDevice device : available) {
+            if (device.getStableKey().equals(activeKey)) {
+                return device;
+            }
+        }
+        available.add(activeDevice);
+        return activeDevice;
+    }
+
     private void updateReceiverSection(boolean animate) {
         boolean collapsible = StreamingService.STATUS_STREAMING.equals(currentStreamingStatus);
         boolean expanded = !collapsible || receiverListExpanded;
@@ -666,14 +708,21 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
     private void restoreStreamingStatus() {
         StreamingService.StatusSnapshot snapshot = StreamingService.getLastStatus();
         applyStreamingStatus(
-                snapshot.getStatus(), snapshot.getMessage(), snapshot.getReceiverKey());
+                snapshot.getStatus(),
+                snapshot.getMessage(),
+                snapshot.getReceiverKey(),
+                snapshot.getReceiverDevice());
     }
 
     private void applyStreamingStatus(String status, String message) {
-        applyStreamingStatus(status, message, activeReceiverKey);
+        applyStreamingStatus(status, message, activeReceiverKey, activeReceiverDevice);
     }
 
-    private void applyStreamingStatus(String status, String message, String receiverKey) {
+    private void applyStreamingStatus(
+            String status,
+            String message,
+            String receiverKey,
+            ReceiverDevice receiverDevice) {
         boolean wasActive = isStreamingActive();
         boolean wasStreaming = StreamingService.STATUS_STREAMING.equals(currentStreamingStatus);
         String resolvedStatus = status == null || status.isBlank()
@@ -686,9 +735,13 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
         if (StreamingService.STATUS_ERROR.equals(resolvedStatus)
                 || StreamingService.STATUS_STOPPED.equals(resolvedStatus)) {
             activeReceiverKey = "";
+            activeReceiverDevice = null;
             receiverListExpanded = false;
         } else if (receiverKey != null && !receiverKey.isEmpty()) {
             activeReceiverKey = receiverKey;
+            if (receiverDevice != null) {
+                activeReceiverDevice = receiverDevice;
+            }
         }
         if (!wasStreaming && StreamingService.STATUS_STREAMING.equals(resolvedStatus)) {
             receiverListExpanded = false;
@@ -744,6 +797,16 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
         }
         unregisterReceiver(statusReceiver);
         receiverRegistered = false;
+    }
+
+    @SuppressWarnings("deprecation")
+    private static ReceiverDevice receiverExtra(Intent intent) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            return intent.getSerializableExtra(
+                    StreamingService.EXTRA_RECEIVER_DEVICE, ReceiverDevice.class);
+        }
+        return (ReceiverDevice) intent.getSerializableExtra(
+                StreamingService.EXTRA_RECEIVER_DEVICE);
     }
 
     private String selectedDeviceKey() {

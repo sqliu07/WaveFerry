@@ -55,3 +55,7 @@ Android 14 及以上会在每次投送前显示系统级捕获对话框，让用
 ## 第三方声明
 
 RAOP 实现参考了 PulseAudio 的 RAOP 客户端。相关声明与 LGPL-2.1-or-later 文本见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [LICENSES/LGPL-2.1-or-later.txt](LICENSES/LGPL-2.1-or-later.txt)。
+
+## 许可证
+
+WaveFerry 以 [MIT License](LICENSE) 开源。第三方组件仍适用其各自的许可证。

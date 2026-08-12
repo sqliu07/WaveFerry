@@ -25,6 +25,7 @@ import app.shengdu.audio.dacp.DacpControlServer;
 import app.shengdu.audio.dacp.DacpSession;
 import app.shengdu.audio.dlna.DlnaRendererDescription;
 import app.shengdu.audio.dlna.DlnaStreamingClient;
+import app.shengdu.audio.discovery.ReceiverDevice;
 import app.shengdu.audio.metadata.MediaSessionMonitor;
 import app.shengdu.audio.metadata.MetadataSendPolicy;
 import app.shengdu.audio.metadata.PlaybackFlowGate;
@@ -57,6 +58,7 @@ public final class StreamingService extends Service {
     public static final String EXTRA_STATUS = "status";
     public static final String EXTRA_MESSAGE = "message";
     public static final String EXTRA_RECEIVER_KEY = "receiver_key";
+    public static final String EXTRA_RECEIVER_DEVICE = "receiver_device";
 
     public static final String STATUS_CONNECTING = "connecting";
     public static final String STATUS_STOPPING = "stopping";
@@ -81,7 +83,7 @@ public final class StreamingService extends Service {
     private static final String NOTIFICATION_CHANNEL_ID = "streaming";
     private static final int NOTIFICATION_ID = 1001;
     private static final int ERROR_NOTIFICATION_ID = 1002;
-    private static volatile StatusSnapshot lastStatus = new StatusSnapshot("", "", "");
+    private static volatile StatusSnapshot lastStatus = new StatusSnapshot("", "", "", null);
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "shengdu-session");
@@ -107,6 +109,7 @@ public final class StreamingService extends Service {
     private AudioStreamFormat activeFormat;
     private String activeReceiverName = "";
     private volatile String activeReceiverKey = "";
+    private volatile ReceiverDevice activeReceiverDevice;
     private boolean awaitingCapture;
     private boolean activeMuteDevice;
     private final DeviceMutePolicy mutePolicy = new DeviceMutePolicy();
@@ -122,6 +125,7 @@ public final class StreamingService extends Service {
             int receiverPort,
             String receiverName,
             String receiverKey,
+            ReceiverDevice receiverDevice,
             Map<String, byte[]> txtAttributes,
             boolean muteDevice,
             AppPreferences.AudioQuality audioQuality) {
@@ -130,6 +134,7 @@ public final class StreamingService extends Service {
         intent.putExtra(EXTRA_PORT, receiverPort);
         intent.putExtra(EXTRA_RECEIVER_NAME, receiverName);
         intent.putExtra(EXTRA_RECEIVER_KEY, receiverKey);
+        intent.putExtra(EXTRA_RECEIVER_DEVICE, receiverDevice);
         intent.putExtra(EXTRA_MUTE_DEVICE, muteDevice);
         intent.putExtra(EXTRA_AUDIO_QUALITY, audioQuality.name());
 
@@ -200,6 +205,7 @@ public final class StreamingService extends Service {
         if (activeReceiverKey == null) {
             activeReceiverKey = "";
         }
+        activeReceiverDevice = receiverExtra(intent);
         startInForeground(sessionReceiverName);
         worker.execute(() -> prepareSession(intent, generation, sessionReceiverName));
         return START_NOT_STICKY;
@@ -808,7 +814,8 @@ public final class StreamingService extends Service {
         // Publish the state before the session worker runs. If the user switches back
         // immediately, MainActivity must not mistake this session for an idle one and
         // restart discovery while the TV connection is being negotiated.
-        lastStatus = new StatusSnapshot(STATUS_CONNECTING, message, activeReceiverKey);
+        lastStatus = new StatusSnapshot(
+                STATUS_CONNECTING, message, activeReceiverKey, activeReceiverDevice);
         Notification notification = buildNotification(message);
         startForeground(
                 NOTIFICATION_ID,
@@ -910,8 +917,10 @@ public final class StreamingService extends Service {
     private void broadcastStatus(String status, String message) {
         if (STATUS_STOPPED.equals(status) || STATUS_ERROR.equals(status)) {
             activeReceiverKey = "";
+            activeReceiverDevice = null;
         }
-        lastStatus = new StatusSnapshot(status, message, activeReceiverKey);
+        lastStatus = new StatusSnapshot(
+                status, message, activeReceiverKey, activeReceiverDevice);
         if (STATUS_CONNECTING.equals(status)
                 || STATUS_STOPPING.equals(status)
                 || STATUS_AWAITING_CAPTURE.equals(status)
@@ -930,7 +939,8 @@ public final class StreamingService extends Service {
                 .setPackage(getPackageName())
                 .putExtra(EXTRA_STATUS, status)
                 .putExtra(EXTRA_MESSAGE, message)
-                .putExtra(EXTRA_RECEIVER_KEY, activeReceiverKey);
+                .putExtra(EXTRA_RECEIVER_KEY, activeReceiverKey)
+                .putExtra(EXTRA_RECEIVER_DEVICE, activeReceiverDevice);
         sendBroadcast(update);
     }
 
@@ -971,6 +981,14 @@ public final class StreamingService extends Service {
         return attributes;
     }
 
+    @SuppressWarnings("deprecation")
+    private static ReceiverDevice receiverExtra(Intent intent) {
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            return intent.getSerializableExtra(EXTRA_RECEIVER_DEVICE, ReceiverDevice.class);
+        }
+        return (ReceiverDevice) intent.getSerializableExtra(EXTRA_RECEIVER_DEVICE);
+    }
+
     private static String readableError(Throwable error) {
         Throwable current = error;
         while (current.getCause() != null && current.getCause() != current) {
@@ -998,7 +1016,8 @@ public final class StreamingService extends Service {
                 || STATUS_AWAITING_CAPTURE.equals(status.status)
                 || STATUS_STREAMING.equals(status.status)) {
             activeReceiverKey = "";
-            lastStatus = new StatusSnapshot(STATUS_STOPPED, "投送服务已结束", "");
+            activeReceiverDevice = null;
+            lastStatus = new StatusSnapshot(STATUS_STOPPED, "投送服务已结束", "", null);
         }
         super.onDestroy();
     }
@@ -1033,11 +1052,17 @@ public final class StreamingService extends Service {
         private final String status;
         private final String message;
         private final String receiverKey;
+        private final ReceiverDevice receiverDevice;
 
-        private StatusSnapshot(String status, String message, String receiverKey) {
+        private StatusSnapshot(
+                String status,
+                String message,
+                String receiverKey,
+                ReceiverDevice receiverDevice) {
             this.status = status;
             this.message = message;
             this.receiverKey = receiverKey;
+            this.receiverDevice = receiverDevice;
         }
 
         public String getStatus() {
@@ -1050,6 +1075,10 @@ public final class StreamingService extends Service {
 
         public String getReceiverKey() {
             return receiverKey;
+        }
+
+        public ReceiverDevice getReceiverDevice() {
+            return receiverDevice;
         }
     }
 }
