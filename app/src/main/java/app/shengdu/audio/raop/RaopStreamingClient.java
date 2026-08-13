@@ -25,6 +25,7 @@ import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class RaopStreamingClient implements Closeable {
     private static final AudioStreamFormat DEFAULT_FORMAT =
@@ -49,7 +50,8 @@ public final class RaopStreamingClient implements Closeable {
     private final byte[] partialPcm = new byte[AlacPacketBuilder.PCM_BYTES_PER_TCP_PACKET];
 
     private int partialPcmLength;
-    private Session session;
+    private volatile Session session;
+    private volatile Session closingSession;
 
     public RaopStreamingClient(InetAddress host, int port, Map<String, byte[]> txtAttributes) {
         this(host, port, txtAttributes, new SecureRandom(), null, null, DEFAULT_FORMAT);
@@ -361,35 +363,64 @@ public final class RaopStreamingClient implements Closeable {
     public synchronized void close() throws IOException {
         partialPcmLength = 0;
         Session current = session;
-        session = null;
         if (current == null) {
             return;
         }
+        closingSession = current;
+        session = null;
 
-        IOException failure = null;
         try {
-            current.rtsp.flush(current.uri, current.sessionId, current.sequenceNumber, current.timestamp);
-        } catch (IOException exception) {
-            failure = exception;
-        }
-        try {
-            current.rtsp.teardown(current.uri, current.sessionId);
-        } catch (IOException exception) {
-            if (failure == null) {
+            IOException failure = null;
+            try {
+                current.rtsp.flush(current.uri, current.sessionId, current.sequenceNumber, current.timestamp);
+            } catch (IOException exception) {
                 failure = exception;
             }
-        }
-        failure = closeSessionTransports(current, failure);
-        try {
-            current.rtsp.close();
-        } catch (IOException exception) {
-            if (failure == null) {
-                failure = exception;
+            try {
+                current.rtsp.teardown(current.uri, current.sessionId);
+            } catch (IOException exception) {
+                if (failure == null) {
+                    failure = exception;
+                }
+            }
+            failure = closeSessionTransports(current, failure);
+            try {
+                current.rtsp.close();
+            } catch (IOException exception) {
+                if (failure == null) {
+                    failure = exception;
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        } finally {
+            if (closingSession == current) {
+                closingSession = null;
             }
         }
-        if (failure != null) {
-            throw failure;
+    }
+
+    /**
+     * Immediately closes the live transport without acquiring the client monitor. This is the
+     * escape hatch for a sender thread blocked inside a synchronized socket write; normal session
+     * shutdown should continue to use {@link #close()} so FLUSH and TEARDOWN are attempted.
+     */
+    public void abort() {
+        Session current = session;
+        if (current == null) {
+            current = closingSession;
         }
+        session = null;
+        if (current == null || !current.beginAbort()) {
+            return;
+        }
+        current.stopUdpWorkers();
+        closeQuietly(current.audioSocket);
+        closeQuietly(current.udpAudioSocket);
+        closeQuietly(current.udpControlSocket);
+        closeQuietly(current.udpTimingSocket);
+        current.rtsp.abort();
     }
 
     private void sendPacket(byte[] pcm, int offset) throws IOException {
@@ -1032,6 +1063,7 @@ public final class RaopStreamingClient implements Closeable {
         boolean firstPacket;
         volatile boolean udpRunning;
         volatile IOException udpWorkerFailure;
+        private final AtomicBoolean abortStarted = new AtomicBoolean();
         Thread controlWorker;
         Thread timingWorker;
 
@@ -1135,6 +1167,10 @@ public final class RaopStreamingClient implements Closeable {
 
         private void stopUdpWorkers() {
             udpRunning = false;
+        }
+
+        private boolean beginAbort() {
+            return abortStarted.compareAndSet(false, true);
         }
 
         private boolean joinUdpWorkers() {
