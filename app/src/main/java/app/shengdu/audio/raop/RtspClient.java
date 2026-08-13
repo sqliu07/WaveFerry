@@ -326,6 +326,19 @@ final class RtspClient implements Closeable {
         }
     }
 
+    /** Closes the socket without clearing stream fields that another thread may currently use. */
+    void abort() {
+        Socket current = socket;
+        if (current == null) {
+            return;
+        }
+        try {
+            current.close();
+        } catch (IOException ignored) {
+            // Transport abort is deliberately best-effort and must stay non-blocking.
+        }
+    }
+
     @Override
     public void close() throws IOException {
         if (socket != null) {

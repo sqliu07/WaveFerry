@@ -40,7 +40,6 @@ import app.shengdu.audio.format.SampleFormat;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.util.Arrays;
@@ -83,6 +82,10 @@ public final class StreamingService extends Service {
     private static final String NOTIFICATION_CHANNEL_ID = "streaming";
     private static final int NOTIFICATION_ID = 1001;
     private static final int ERROR_NOTIFICATION_ID = 1002;
+    private static final int RAOP_PCM_QUEUE_BYTES = 32 * 1024;
+    private static final long RAOP_SENDER_GRACEFUL_STOP_MS = 300;
+    private static final long RAOP_SENDER_ABORT_STOP_MS = 1_000;
+    private static final int ANY_SESSION_GENERATION = -1;
     private static volatile StatusSnapshot lastStatus = new StatusSnapshot("", "", "", null);
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
@@ -92,20 +95,25 @@ public final class StreamingService extends Service {
     });
     private final AtomicBoolean stopping = new AtomicBoolean();
     private final AtomicInteger sessionGeneration = new AtomicInteger();
+    private final Object sessionLifecycleLock = new Object();
+    private final Object statusDispatchLock = new Object();
+    private final Object muteLifecycleLock = new Object();
+    private int sessionOwnerGeneration;
 
-    private RaopStreamingClient raopClient;
-    private DlnaStreamingClient dlnaClient;
-    private PlaybackCapture playbackCapture;
-    private MediaProjection mediaProjection;
-    private DacpSession dacpSession;
+    private volatile RaopStreamingClient raopClient;
+    private volatile AsyncPcmSender raopPcmSender;
+    private volatile DlnaStreamingClient dlnaClient;
+    private volatile PlaybackCapture playbackCapture;
+    private volatile MediaProjection mediaProjection;
+    private volatile DacpSession dacpSession;
     private WifiManager.WifiLock wifiLock;
     private WifiManager.MulticastLock multicastLock;
     private PowerManager.WakeLock wakeLock;
-    private MediaSessionMonitor metadataMonitor;
-    private HandlerThread metadataThread;
-    private MetadataSendPolicy metadataPolicy;
-    private MetadataSendPolicy artworkPolicy;
-    private MetadataSendPolicy progressPolicy;
+    private volatile MediaSessionMonitor metadataMonitor;
+    private volatile HandlerThread metadataThread;
+    private volatile MetadataSendPolicy metadataPolicy;
+    private volatile MetadataSendPolicy artworkPolicy;
+    private volatile MetadataSendPolicy progressPolicy;
     private AudioStreamFormat activeFormat;
     private String activeReceiverName = "";
     private volatile String activeReceiverKey = "";
@@ -215,17 +223,26 @@ public final class StreamingService extends Service {
         if (!isCurrentGeneration(generation)) {
             return;
         }
-        stopSession(false);
-        if (!isCurrentGeneration(generation)) {
-            return;
+        cleanupStaleSession();
+        synchronized (sessionLifecycleLock) {
+            if (!isCurrentGeneration(generation)) {
+                return;
+            }
+            stopping.set(false);
+            sessionOwnerGeneration = generation;
+            playbackFlowGate.reset();
         }
-        stopping.set(false);
-        playbackFlowGate.reset();
         try {
-            broadcastStatus(
+            if (!broadcastSessionStatus(
+                    generation,
                     STATUS_CONNECTING,
-                    getString(R.string.status_connecting_receiver, sessionReceiverName));
-            acquireNetworkLocks();
+                    getString(R.string.status_connecting_receiver, sessionReceiverName))) {
+                return;
+            }
+            if (!acquireNetworkLocks(generation)) {
+                cleanupStaleSession();
+                return;
+            }
 
             InetAddress host = InetAddress.getByName(requiredStringExtra(intent, EXTRA_HOST));
             int port = intent.getIntExtra(EXTRA_PORT, -1);
@@ -247,8 +264,12 @@ public final class StreamingService extends Service {
             if (dlnaTarget) {
                 DlnaStreamingClient client = createDlnaClient(
                         host, sessionReceiverName, txt, selectedFormat, generation);
-                dlnaClient = client;
                 client.start();
+                if (!publishDlnaTransport(generation, client)) {
+                    client.close();
+                    cleanupStaleSession();
+                    return;
+                }
             } else {
                 DacpSession remoteControl = mediaSessionAvailable
                         ? startDacpSession(generation, host)
@@ -267,24 +288,34 @@ public final class StreamingService extends Service {
                                 selectedFormat);
                 configureMetadata(client);
                 client.connect();
-                raopClient = client;
+                AsyncPcmSender sender = new AsyncPcmSender(
+                        RAOP_PCM_QUEUE_BYTES,
+                        pcm -> client.writePcm(pcm, 0, pcm.length),
+                        client::abort,
+                        client::close,
+                        error -> onRaopSenderFailure(generation, error));
+                sender.start();
+                if (!publishRaopTransport(generation, client, sender)) {
+                    sender.stop(RAOP_SENDER_GRACEFUL_STOP_MS, RAOP_SENDER_ABORT_STOP_MS);
+                    cleanupStaleSession();
+                    return;
+                }
             }
-            if (stopIfStale(generation)) {
-                return;
+            if (!publishPreparedSessionState(
+                    generation,
+                    selectedFormat,
+                    sessionReceiverName,
+                    intent.getBooleanExtra(EXTRA_MUTE_DEVICE, false))) {
+                cleanupStaleSession();
             }
-            activeFormat = selectedFormat;
-            activeReceiverName = sessionReceiverName;
-            activeMuteDevice = intent.getBooleanExtra(EXTRA_MUTE_DEVICE, false);
-            awaitingCapture = true;
-            broadcastStatus(
-                    STATUS_AWAITING_CAPTURE,
-                    getString(R.string.status_receiver_connected));
         } catch (Throwable error) {
             if (sessionGeneration.compareAndSet(generation, generation + 1)) {
-                broadcastStatus(STATUS_ERROR, readableError(error));
-                stopSession(true, false);
+                stopping.set(true);
+                broadcastTerminalStatusIfCurrent(
+                        generation + 1, STATUS_ERROR, readableError(error));
+                stopSessionOwnedBy(generation, true, false);
             } else {
-                stopSession(false);
+                cleanupStaleSession();
             }
         }
     }
@@ -295,27 +326,37 @@ public final class StreamingService extends Service {
         }
         AudioStreamFormat format = activeFormat;
         if (!awaitingCapture || format == null || (raopClient == null && dlnaClient == null)) {
-            broadcastStatus(STATUS_ERROR, getString(R.string.capture_session_missing));
-            stopSession(true, false);
+            if (sessionGeneration.compareAndSet(generation, generation + 1)) {
+                stopping.set(true);
+                broadcastTerminalStatusIfCurrent(
+                        generation + 1,
+                        STATUS_ERROR,
+                        getString(R.string.capture_session_missing));
+                stopSessionOwnedBy(generation, true, false);
+            }
             return;
         }
         try {
-            broadcastStatus(STATUS_CONNECTING, getString(R.string.status_starting_capture));
-            startPlaybackCapture(intent, generation, format);
-            if (stopIfStale(generation)) {
+            if (!broadcastSessionStatus(
+                    generation, STATUS_CONNECTING, getString(R.string.status_starting_capture))) {
+                cleanupStaleSession();
                 return;
             }
-            awaitingCapture = false;
-            broadcastStatus(
-                    STATUS_STREAMING,
-                    getString(R.string.status_streaming_receiver, activeReceiverName));
-            applyDeviceMute(activeMuteDevice);
+            if (!startPlaybackCapture(intent, generation, format)) {
+                cleanupStaleSession();
+                return;
+            }
+            if (!publishStreamingSessionState(generation)) {
+                cleanupStaleSession();
+            }
         } catch (Throwable error) {
             if (sessionGeneration.compareAndSet(generation, generation + 1)) {
-                broadcastStatus(STATUS_ERROR, readableError(error));
-                stopSession(true, false);
+                stopping.set(true);
+                broadcastTerminalStatusIfCurrent(
+                        generation + 1, STATUS_ERROR, readableError(error));
+                stopSessionOwnedBy(generation, true, false);
             } else {
-                stopSession(false);
+                cleanupStaleSession();
             }
         }
     }
@@ -324,7 +365,90 @@ public final class StreamingService extends Service {
         return sessionGeneration.get() == generation;
     }
 
-    private void startPlaybackCapture(
+    private boolean publishRaopTransport(
+            int generation, RaopStreamingClient client, AsyncPcmSender sender) {
+        synchronized (sessionLifecycleLock) {
+            if (!isCurrentGeneration(generation) || stopping.get()) {
+                return false;
+            }
+            raopClient = client;
+            raopPcmSender = sender;
+            return true;
+        }
+    }
+
+    private boolean publishDlnaTransport(int generation, DlnaStreamingClient client) {
+        synchronized (sessionLifecycleLock) {
+            if (!isCurrentGeneration(generation) || stopping.get()) {
+                return false;
+            }
+            dlnaClient = client;
+            return true;
+        }
+    }
+
+    private boolean publishPreparedSessionState(
+            int generation,
+            AudioStreamFormat format,
+            String receiverName,
+            boolean muteDevice) {
+        synchronized (sessionLifecycleLock) {
+            if (!isCurrentGeneration(generation) || stopping.get()) {
+                return false;
+            }
+            activeFormat = format;
+            activeReceiverName = receiverName;
+            activeMuteDevice = muteDevice;
+            awaitingCapture = true;
+        }
+        return broadcastSessionStatus(
+                generation, STATUS_AWAITING_CAPTURE, getString(R.string.status_receiver_connected));
+    }
+
+    private boolean publishStreamingSessionState(int generation) {
+        boolean muteDevice;
+        String receiverName;
+        synchronized (sessionLifecycleLock) {
+            if (!isCurrentGeneration(generation)
+                    || stopping.get()
+                    || playbackCapture == null) {
+                return false;
+            }
+            muteDevice = activeMuteDevice;
+            receiverName = activeReceiverName;
+            awaitingCapture = false;
+        }
+        if (muteDevice && !applyDeviceMuteForGeneration(generation)) {
+            return false;
+        }
+        return broadcastSessionStatus(
+                generation,
+                STATUS_STREAMING,
+                getString(R.string.status_streaming_receiver, receiverName));
+    }
+
+    private boolean broadcastSessionStatus(int generation, String status, String message) {
+        synchronized (statusDispatchLock) {
+            if (!isCurrentGeneration(generation) || stopping.get()) {
+                return false;
+            }
+            broadcastStatusLocked(status, message);
+            return true;
+        }
+    }
+
+    private boolean broadcastTerminalStatusIfCurrent(
+            int expectedGeneration, String status, String message) {
+        synchronized (statusDispatchLock) {
+            if (!isCurrentGeneration(expectedGeneration)) {
+                return false;
+            }
+            broadcastStatusLocked(status, message);
+            return true;
+        }
+    }
+
+    private boolean startPlaybackCapture(
             Intent intent, int generation, AudioStreamFormat selectedFormat) {
         Intent projectionData = getProjectionData(intent);
         int resultCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT, 0);
@@ -334,17 +458,27 @@ public final class StreamingService extends Service {
         if (projection == null) {
             throw new IllegalStateException("未获得系统音频捕获授权");
         }
-        mediaProjection = projection;
 
         PlaybackCapture capture = new PlaybackCapture(
                 projection,
                 (buffer, byteCount, framePosition) -> writePcm(buffer, byteCount),
                 new CaptureListener(generation),
                 selectedFormat);
-        playbackCapture = capture;
         if (!capture.start()) {
+            capture.stop();
+            projection.stop();
             throw new IllegalStateException("无法启动系统播放音频捕获");
         }
+        synchronized (sessionLifecycleLock) {
+            if (isCurrentGeneration(generation) && !stopping.get()) {
+                mediaProjection = projection;
+                playbackCapture = capture;
+                return true;
+            }
+        }
+        capture.stop();
+        projection.stop();
+        return false;
     }
 
     private static AudioStreamFormat selectTransportFormat(
@@ -439,8 +573,12 @@ public final class StreamingService extends Service {
         if (isCurrentGeneration(generation)) {
             return false;
         }
-        stopSession(false);
+        cleanupStaleSession();
         return true;
+    }
+
+    private void cleanupStaleSession() {
+        stopSession(false, false, true);
     }
 
     private void writePcm(byte[] buffer, int byteCount) {
@@ -451,19 +589,23 @@ public final class StreamingService extends Service {
             }
             return;
         }
-        RaopStreamingClient client = raopClient;
-        if (client == null || stopping.get()) {
+        AsyncPcmSender sender = raopPcmSender;
+        if (sender == null || stopping.get()) {
             return;
         }
-        synchronized (client) {
-            if (stopping.get() || client != raopClient || !playbackFlowGate.shouldForwardPcm()) {
-                return;
-            }
-            try {
-                client.writePcm(buffer, 0, byteCount);
-            } catch (IOException error) {
-                throw new UncheckedIOException(error);
-            }
+        if (!stopping.get()
+                && sender == raopPcmSender
+                && playbackFlowGate.shouldForwardPcm()) {
+            sender.offer(buffer, 0, byteCount);
+        }
+    }
+
+    private void onRaopSenderFailure(int generation, IOException error) {
+        if (sessionGeneration.compareAndSet(generation, generation + 1)
+                && stopping.compareAndSet(false, true)) {
+            broadcastTerminalStatusIfCurrent(
+                    generation + 1, STATUS_ERROR, readableError(error));
+            worker.execute(() -> stopSessionOwnedBy(generation, true, false));
         }
     }
 
@@ -479,14 +621,22 @@ public final class StreamingService extends Service {
                 new Handler(thread.getLooper()),
                 (track, artwork) -> onMetadataChanged(generation, track, artwork));
 
-        metadataThread = thread;
-        metadataMonitor = monitor;
         if (!monitor.start()) {
             // Notification-listener access not granted: metadata and DACP stay off.
-            stopMetadata();
+            monitor.stop();
+            thread.quitSafely();
             return false;
         }
-        return true;
+        synchronized (sessionLifecycleLock) {
+            if (isCurrentGeneration(generation) && !stopping.get()) {
+                metadataThread = thread;
+                metadataMonitor = monitor;
+                return true;
+            }
+        }
+        monitor.stop();
+        thread.quitSafely();
+        return false;
     }
 
     private void configureMetadata(RaopStreamingClient client) {
@@ -499,17 +649,31 @@ public final class StreamingService extends Service {
     }
 
     private void onMetadataChanged(int generation, TrackMetadata track, Bitmap artwork) {
-        PlaybackFlowGate.Transition transition = playbackFlowGate.update(track);
-        long revision = playbackFlowGate.revision();
-        RaopStreamingClient connectedClient = raopClient;
+        PlaybackFlowGate.Transition transition;
+        long revision;
+        RaopStreamingClient connectedClient;
+        AsyncPcmSender connectedSender;
+        DlnaStreamingClient connectedDlna;
+        synchronized (sessionLifecycleLock) {
+            if (!isCurrentGeneration(generation) || stopping.get()) {
+                return;
+            }
+            transition = playbackFlowGate.update(track);
+            revision = playbackFlowGate.revision();
+            connectedClient = raopClient;
+            connectedSender = raopPcmSender;
+            connectedDlna = dlnaClient;
+        }
         if (transition == PlaybackFlowGate.Transition.PAUSED && connectedClient != null) {
+            if (connectedSender != null) {
+                connectedSender.discardQueued();
+            }
             try {
                 connectedClient.flushAudio();
             } catch (IOException | RuntimeException ignored) {
                 // Best-effort transport freeze; metadata still continues.
             }
         }
-        DlnaStreamingClient connectedDlna = dlnaClient;
         if (connectedDlna != null && transition != PlaybackFlowGate.Transition.NONE) {
             worker.execute(() -> {
                 try {
@@ -536,8 +700,14 @@ public final class StreamingService extends Service {
                     getApplicationContext(),
                     host,
                     command -> worker.execute(() -> dispatchDacpCommand(generation, command)));
-            dacpSession = started;
-            return started;
+            synchronized (sessionLifecycleLock) {
+                if (isCurrentGeneration(generation) && !stopping.get()) {
+                    dacpSession = started;
+                    return started;
+                }
+            }
+            started.close();
+            return null;
         } catch (IOException | RuntimeException ignored) {
             // Reverse control is optional; RAOP audio remains usable without it.
             return null;
@@ -658,12 +828,14 @@ public final class StreamingService extends Service {
 
     private void sendProgressMetadata(RaopStreamingClient client, TrackMetadata track) {
         // Play/pause transitions re-send once; position-only changes never reach here.
-        trackProgressSender.send(
-                progressPolicy,
-                track,
-                client.currentRtpTimestamp(),
-                client.sampleRateHz(),
-                client::sendProgress);
+        synchronized (trackProgressSender) {
+            trackProgressSender.send(
+                    progressPolicy,
+                    track,
+                    client.currentRtpTimestamp(),
+                    client.sampleRateHz(),
+                    client::sendProgress);
+        }
     }
 
     private static byte[] encodeArtwork(Bitmap artwork) {
@@ -704,24 +876,6 @@ public final class StreamingService extends Service {
         }
     }
 
-    private void stopMetadata() {
-        metadataPolicy = null;
-        artworkPolicy = null;
-        progressPolicy = null;
-        playbackFlowGate.reset();
-        trackProgressSender.reset();
-        MediaSessionMonitor monitor = metadataMonitor;
-        metadataMonitor = null;
-        if (monitor != null) {
-            monitor.stop();
-        }
-        HandlerThread thread = metadataThread;
-        metadataThread = null;
-        if (thread != null) {
-            thread.quitSafely();
-        }
-    }
-
     /**
      * Optional "mute this device while casting": sets the music stream to 0 after the
      * session is up and restores the previous volume on stop, unless the user picked a
@@ -733,16 +887,32 @@ public final class StreamingService extends Service {
         }
         AudioManager audioManager = getSystemService(AudioManager.class);
         int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-        int target = mutePolicy.onStreamingStarted(true, current);
+        int target;
+        synchronized (mutePolicy) {
+            target = mutePolicy.onStreamingStarted(true, current);
+        }
         if (target != DeviceMutePolicy.NO_CHANGE) {
             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
+        }
+    }
+
+    private boolean applyDeviceMuteForGeneration(int generation) {
+        synchronized (muteLifecycleLock) {
+            if (!isCurrentGeneration(generation) || stopping.get()) {
+                return false;
+            }
+            applyDeviceMute(true);
+            return true;
         }
     }
 
     private void restoreDeviceVolume() {
         AudioManager audioManager = getSystemService(AudioManager.class);
         int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-        int restored = mutePolicy.onStreamingStopped(current);
+        int restored;
+        synchronized (mutePolicy) {
+            restored = mutePolicy.onStreamingStopped(current);
+        }
         if (restored != DeviceMutePolicy.NO_CHANGE) {
             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, restored, 0);
         }
@@ -753,53 +923,124 @@ public final class StreamingService extends Service {
     }
 
     private void stopSession(boolean stopService, boolean announceStopped) {
-        if (!stopping.compareAndSet(false, true) && !stopService) {
+        stopSession(stopService, announceStopped, false, ANY_SESSION_GENERATION);
+    }
+
+    private void stopSession(boolean stopService, boolean announceStopped, boolean forceCleanup) {
+        stopSession(stopService, announceStopped, forceCleanup, ANY_SESSION_GENERATION);
+    }
+
+    private void stopSessionOwnedBy(int generation, boolean stopService, boolean announceStopped) {
+        stopSession(stopService, announceStopped, false, generation);
+    }
+
+    private void stopSession(
+            boolean stopService,
+            boolean announceStopped,
+            boolean forceCleanup,
+            int expectedGeneration) {
+        boolean targeted = expectedGeneration != ANY_SESSION_GENERATION;
+        if (!targeted
+                && !stopping.compareAndSet(false, true)
+                && !stopService
+                && !forceCleanup) {
             return;
         }
 
-        awaitingCapture = false;
-        activeFormat = null;
-        activeReceiverName = "";
-        activeMuteDevice = false;
+        AsyncPcmSender sender;
+        RaopStreamingClient client;
+        DlnaStreamingClient dlna;
+        DacpSession remoteControl;
+        MediaSessionMonitor monitor;
+        HandlerThread metadataHandlerThread;
+        PlaybackCapture capture;
+        MediaProjection projection;
+        WifiManager.WifiLock heldWifiLock;
+        WifiManager.MulticastLock heldMulticastLock;
+        PowerManager.WakeLock heldWakeLock;
+        boolean stopServiceAfterCleanup;
+        synchronized (sessionLifecycleLock) {
+            if (targeted && sessionOwnerGeneration != expectedGeneration) {
+                return;
+            }
+            stopServiceAfterCleanup = stopService
+                    && (!targeted || sessionGeneration.get() == expectedGeneration + 1);
+            stopping.set(true);
+            sessionOwnerGeneration = 0;
+            awaitingCapture = false;
+            activeFormat = null;
+            activeReceiverName = "";
+            activeMuteDevice = false;
+            sender = raopPcmSender;
+            raopPcmSender = null;
+            client = raopClient;
+            raopClient = null;
+            dlna = dlnaClient;
+            dlnaClient = null;
+            remoteControl = dacpSession;
+            dacpSession = null;
+            monitor = metadataMonitor;
+            metadataMonitor = null;
+            metadataHandlerThread = metadataThread;
+            metadataThread = null;
+            capture = playbackCapture;
+            playbackCapture = null;
+            projection = mediaProjection;
+            mediaProjection = null;
+            heldWifiLock = wifiLock;
+            wifiLock = null;
+            heldMulticastLock = multicastLock;
+            multicastLock = null;
+            heldWakeLock = wakeLock;
+            wakeLock = null;
+            metadataPolicy = null;
+            artworkPolicy = null;
+            progressPolicy = null;
+        }
+        if (sender != null) {
+            sender.stop(RAOP_SENDER_GRACEFUL_STOP_MS, RAOP_SENDER_ABORT_STOP_MS);
+        } else if (client != null) {
+            try {
+                client.close();
+            } catch (IOException ignored) {
+                // Connection setup may have failed before the sender took ownership.
+            }
+        }
 
-        DacpSession remoteControl = dacpSession;
-        dacpSession = null;
         if (remoteControl != null) {
             remoteControl.close();
         }
 
-        stopMetadata();
-        restoreDeviceVolume();
+        if (monitor != null) {
+            monitor.stop();
+        }
+        if (metadataHandlerThread != null) {
+            metadataHandlerThread.quitSafely();
+        }
+        synchronized (sessionLifecycleLock) {
+            playbackFlowGate.reset();
+        }
+        synchronized (trackProgressSender) {
+            trackProgressSender.reset();
+        }
+        synchronized (muteLifecycleLock) {
+            restoreDeviceVolume();
+        }
 
-        PlaybackCapture capture = playbackCapture;
-        playbackCapture = null;
         if (capture != null) {
             capture.stop();
         }
 
-        MediaProjection projection = mediaProjection;
-        mediaProjection = null;
         if (projection != null) {
             projection.stop();
         }
 
-        RaopStreamingClient client = raopClient;
-        raopClient = null;
-        if (client != null) {
-            try {
-                client.close();
-            } catch (IOException ignored) {
-                // The receiver may already have closed the session.
-            }
-        }
-        DlnaStreamingClient dlna = dlnaClient;
-        dlnaClient = null;
         if (dlna != null) {
             dlna.close();
         }
-        releaseNetworkLocks();
+        releaseNetworkLocks(heldWifiLock, heldMulticastLock, heldWakeLock);
 
-        if (stopService) {
+        if (stopServiceAfterCleanup) {
             if (announceStopped) {
                 broadcastStatus(STATUS_STOPPED, "投送已停止");
             }
@@ -880,41 +1121,69 @@ public final class StreamingService extends Service {
     }
 
     @SuppressLint("WakelockTimeout")
-    private void acquireNetworkLocks() {
+    private boolean acquireNetworkLocks(int generation) {
         WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
-        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Shengdu:stream");
-        wifiLock.setReferenceCounted(false);
-        wifiLock.acquire();
+        WifiManager.WifiLock acquiredWifiLock = null;
+        WifiManager.MulticastLock acquiredMulticastLock = null;
+        PowerManager.WakeLock acquiredWakeLock = null;
+        try {
+            acquiredWifiLock = wifiManager.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Shengdu:stream");
+            acquiredWifiLock.setReferenceCounted(false);
+            acquiredWifiLock.acquire();
 
-        multicastLock = wifiManager.createMulticastLock("Shengdu:dacp");
-        multicastLock.setReferenceCounted(false);
-        multicastLock.acquire();
+            acquiredMulticastLock = wifiManager.createMulticastLock("Shengdu:dacp");
+            acquiredMulticastLock.setReferenceCounted(false);
+            acquiredMulticastLock.acquire();
 
-        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Shengdu:stream");
-        wakeLock.setReferenceCounted(false);
-        // The user controls an unbounded foreground streaming session. A fixed timeout
-        // would silently break long playback; stopSession/onDestroy always release it.
-        wakeLock.acquire();
+            PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+            acquiredWakeLock = powerManager.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK, "Shengdu:stream");
+            acquiredWakeLock.setReferenceCounted(false);
+            // The user controls an unbounded foreground streaming session. A fixed timeout
+            // would silently break long playback; stopSession/onDestroy always release it.
+            acquiredWakeLock.acquire();
+
+            synchronized (sessionLifecycleLock) {
+                if (isCurrentGeneration(generation) && !stopping.get()) {
+                    wifiLock = acquiredWifiLock;
+                    multicastLock = acquiredMulticastLock;
+                    wakeLock = acquiredWakeLock;
+                    return true;
+                }
+            }
+        } catch (RuntimeException error) {
+            releaseNetworkLocks(acquiredWifiLock, acquiredMulticastLock, acquiredWakeLock);
+            throw error;
+        }
+        releaseNetworkLocks(acquiredWifiLock, acquiredMulticastLock, acquiredWakeLock);
+        return false;
     }
 
-    private void releaseNetworkLocks() {
-        if (wifiLock != null && wifiLock.isHeld()) {
-            wifiLock.release();
+    private static void releaseNetworkLocks(
+            WifiManager.WifiLock wifi,
+            WifiManager.MulticastLock multicast,
+            PowerManager.WakeLock wake) {
+        if (wifi != null && wifi.isHeld()) {
+            wifi.release();
         }
-        wifiLock = null;
-        if (multicastLock != null && multicastLock.isHeld()) {
-            multicastLock.release();
+        if (multicast != null && multicast.isHeld()) {
+            multicast.release();
         }
-        multicastLock = null;
-        if (wakeLock != null && wakeLock.isHeld()) {
-            wakeLock.release();
+        if (wake != null && wake.isHeld()) {
+            wake.release();
         }
-        wakeLock = null;
     }
 
     @SuppressLint("MissingPermission")
     private void broadcastStatus(String status, String message) {
+        synchronized (statusDispatchLock) {
+            broadcastStatusLocked(status, message);
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void broadcastStatusLocked(String status, String message) {
         if (STATUS_STOPPED.equals(status) || STATUS_ERROR.equals(status)) {
             activeReceiverKey = "";
             activeReceiverDevice = null;
@@ -1008,7 +1277,7 @@ public final class StreamingService extends Service {
     @Override
     public void onDestroy() {
         sessionGeneration.incrementAndGet();
-        stopSession(false);
+        cleanupStaleSession();
         worker.shutdownNow();
         StatusSnapshot status = lastStatus;
         if (STATUS_CONNECTING.equals(status.status)
@@ -1034,7 +1303,7 @@ public final class StreamingService extends Service {
             if (state == PlaybackCapture.State.STOPPED
                     && sessionGeneration.compareAndSet(generation, generation + 1)
                     && stopping.compareAndSet(false, true)) {
-                worker.execute(() -> stopSession(true));
+                worker.execute(() -> stopSessionOwnedBy(generation, true, true));
             }
         }
 
@@ -1042,8 +1311,9 @@ public final class StreamingService extends Service {
         public void onError(Throwable error) {
             if (sessionGeneration.compareAndSet(generation, generation + 1)
                     && stopping.compareAndSet(false, true)) {
-                broadcastStatus(STATUS_ERROR, readableError(error));
-                worker.execute(() -> stopSession(true, false));
+                broadcastTerminalStatusIfCurrent(
+                        generation + 1, STATUS_ERROR, readableError(error));
+                worker.execute(() -> stopSessionOwnedBy(generation, true, false));
             }
         }
     }

@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 
 public class RaopStreamingClientTest {
@@ -629,6 +630,80 @@ public class RaopStreamingClientTest {
         assertTrue(exception.getMessage().contains("offset=2147483647"));
     }
 
+    @Test
+    public void abortClosesTransportWhileWritePcmOwnsClientMonitor() throws Exception {
+        try (BlockingTcpRaopServer server = new BlockingTcpRaopServer()) {
+            RaopStreamingClient sender = new RaopStreamingClient(
+                    InetAddress.getLoopbackAddress(),
+                    server.controlPort(),
+                    Collections.singletonMap("et", "0".getBytes(StandardCharsets.US_ASCII)),
+                    new FixedSecureRandom((byte) 0x11));
+            sender.connect();
+            assertTrue(server.awaitConnected());
+
+            byte[] pcm = samplePcm(4_000_000);
+            AtomicReference<Throwable> writeResult = new AtomicReference<>();
+            Thread writer = new Thread(() -> {
+                try {
+                    sender.writePcm(pcm, 0, pcm.length);
+                } catch (Throwable error) {
+                    writeResult.set(error);
+                }
+            }, "raop-blocked-writer-test");
+            writer.start();
+            assertTrue(server.awaitAudioWriteStarted());
+            assertTrue("test writer did not reach the blocked transport", writer.isAlive());
+
+            long startedNs = System.nanoTime();
+            sender.abort();
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs);
+            writer.join(2_000);
+
+            assertTrue("abort blocked for " + elapsedMs + " ms", elapsedMs < 1_000);
+            assertFalse("transport abort did not release writePcm", writer.isAlive());
+            // A fast loopback kernel may accept the remaining bytes just before abort. Both a
+            // completed write and an IOException are valid; the contract is bounded teardown.
+            assertTrue(writeResult.get() == null
+                    || writeResult.get() instanceof IOException
+                    || writeResult.get() instanceof IllegalStateException);
+            assertTrue(server.awaitClientClosed());
+            sender.abort();
+            sender.close();
+        }
+    }
+
+    @Test
+    public void abortAlsoReleasesCloseBlockedWaitingForFlushResponse() throws Exception {
+        try (BlockingTcpRaopServer server = new BlockingTcpRaopServer()) {
+            RaopStreamingClient sender = new RaopStreamingClient(
+                    InetAddress.getLoopbackAddress(),
+                    server.controlPort(),
+                    Collections.singletonMap("et", "0".getBytes(StandardCharsets.US_ASCII)),
+                    new FixedSecureRandom((byte) 0x11));
+            sender.connect();
+            assertTrue(server.awaitConnected());
+
+            AtomicReference<Throwable> closeResult = new AtomicReference<>();
+            Thread closer = new Thread(() -> {
+                try {
+                    sender.close();
+                } catch (Throwable error) {
+                    closeResult.set(error);
+                }
+            }, "raop-blocked-close-test");
+            closer.start();
+            assertTrue(server.awaitFlushReceived());
+            assertTrue("test close did not wait for FLUSH", closer.isAlive());
+
+            sender.abort();
+            closer.join(2_000);
+
+            assertFalse("transport abort did not release close", closer.isAlive());
+            assertTrue(closeResult.get() instanceof IOException);
+            assertTrue(server.awaitClientClosed());
+        }
+    }
+
     private static byte[] samplePcm(int frames) {
         byte[] pcm = new byte[frames * AlacPacketBuilder.PCM_BYTES_PER_FRAME];
         for (int offset = 0; offset < pcm.length; offset += 8) {
@@ -963,6 +1038,117 @@ public class RaopStreamingClientTest {
             controlServer.close();
             audioServer.close();
             controlThread.join(5000);
+            if (failure != null) {
+                throw new AssertionError(failure);
+            }
+        }
+    }
+
+    private static final class BlockingTcpRaopServer implements AutoCloseable {
+        private final ServerSocket controlServer;
+        private final ServerSocket audioServer;
+        private final Thread serverThread;
+        private final CountDownLatch connected = new CountDownLatch(1);
+        private final CountDownLatch audioWriteStarted = new CountDownLatch(1);
+        private final CountDownLatch flushReceived = new CountDownLatch(1);
+        private final CountDownLatch clientClosed = new CountDownLatch(1);
+        private volatile Throwable failure;
+
+        private BlockingTcpRaopServer() throws IOException {
+            controlServer = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+            audioServer = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+            serverThread = new Thread(this::runServer, "raop-test-blocking-server");
+            serverThread.start();
+        }
+
+        private int controlPort() {
+            return controlServer.getLocalPort();
+        }
+
+        private boolean awaitConnected() throws InterruptedException {
+            return connected.await(2, TimeUnit.SECONDS);
+        }
+
+        private boolean awaitClientClosed() throws InterruptedException {
+            boolean closed = clientClosed.await(2, TimeUnit.SECONDS);
+            if (failure != null) {
+                throw new AssertionError(failure);
+            }
+            return closed;
+        }
+
+        private boolean awaitAudioWriteStarted() throws InterruptedException {
+            return audioWriteStarted.await(2, TimeUnit.SECONDS);
+        }
+
+        private boolean awaitFlushReceived() throws InterruptedException {
+            return flushReceived.await(2, TimeUnit.SECONDS);
+        }
+
+        private void runServer() {
+            try (Socket control = controlServer.accept()) {
+                control.setSoTimeout(5_000);
+                InputStream controlIn = control.getInputStream();
+                OutputStream controlOut = control.getOutputStream();
+                Socket audio = null;
+                for (int index = 0; index < 4; index++) {
+                    RecordedRequest request = readRequest(controlIn);
+                    StringBuilder response = new StringBuilder("RTSP/1.0 200 OK\r\n");
+                    if ("SETUP".equals(request.method)) {
+                        response.append("Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=record;server_port=")
+                                .append(audioServer.getLocalPort()).append("\r\n")
+                                .append("Session: 123456;timeout=60\r\n");
+                    }
+                    response.append("\r\n");
+                    controlOut.write(response.toString().getBytes(StandardCharsets.US_ASCII));
+                    controlOut.flush();
+                    if ("SETUP".equals(request.method)) {
+                        audio = audioServer.accept();
+                        audio.setReceiveBufferSize(1_024);
+                    }
+                }
+                connected.countDown();
+                try (Socket ignored = audio) {
+                    Socket capturedAudio = audio;
+                    Thread audioObserver = new Thread(() -> {
+                        try {
+                            if (capturedAudio.getInputStream().read() >= 0) {
+                                audioWriteStarted.countDown();
+                            }
+                        } catch (IOException ignoredError) {
+                            // Abort may close the socket before an audio byte arrives.
+                        }
+                    }, "raop-test-audio-observer");
+                    audioObserver.setDaemon(true);
+                    audioObserver.start();
+
+                    try {
+                        RecordedRequest request = readRequest(controlIn);
+                        if ("FLUSH".equals(request.method)) {
+                            flushReceived.countDown();
+                        }
+                        while (controlIn.read() >= 0) {
+                            // Keep FLUSH unanswered until the client aborts the RTSP socket.
+                        }
+                    } catch (EOFException expectedAbort) {
+                        // The test intentionally closes the control transport without TEARDOWN.
+                    }
+                }
+            } catch (Throwable error) {
+                if (!controlServer.isClosed() && !audioServer.isClosed()) {
+                    failure = error;
+                }
+            } finally {
+                connected.countDown();
+                clientClosed.countDown();
+            }
+        }
+
+        @Override
+        public void close() throws Exception {
+            controlServer.close();
+            audioServer.close();
+            serverThread.join(5_000);
             if (failure != null) {
                 throw new AssertionError(failure);
             }
