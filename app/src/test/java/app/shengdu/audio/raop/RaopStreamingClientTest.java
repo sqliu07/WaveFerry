@@ -156,6 +156,38 @@ public class RaopStreamingClientTest {
     }
 
     @Test
+    public void negotiated48KFormatIsUsedBySdpAndPacketPayload() throws Exception {
+        try (TcpLoopbackRaopServer server = new TcpLoopbackRaopServer()) {
+            AudioStreamFormat format = new AudioStreamFormat(
+                    48_000, 2, SampleFormat.PCM16_LE);
+            RaopStreamingClient sender = new RaopStreamingClient(
+                    InetAddress.getLoopbackAddress(),
+                    server.controlPort(),
+                    txt("sr", "48000", "ss", "16", "ch", "2", "cn", "1", "et", "0"),
+                    new FixedSecureRandom((byte) 0x11),
+                    null,
+                    null,
+                    format);
+
+            byte[] pcm = samplePcm(AlacPacketBuilder.FRAMES_PER_TCP_PACKET);
+            sender.connect();
+            sender.writePcm(pcm, 0, pcm.length);
+            sender.close();
+
+            assertTrue(server.awaitFinished());
+            String announceBody = new String(
+                    server.request("ANNOUNCE").body, StandardCharsets.US_ASCII);
+            assertTrue(announceBody.contains(
+                    "a=fmtp:96 4096 0 16 40 10 14 2 255 0 0 48000"));
+            assertEquals(48_000, sender.sampleRateHz());
+            byte[] audioPacket = server.audioPacket();
+            assertNotNull(audioPacket);
+            assertArrayEquals(pcm, decodeUncompressedAlac(
+                    slice(audioPacket, 16, audioPacket.length - 16)));
+        }
+    }
+
+    @Test
     public void senderIncludesDacpCredentialsOnEveryRtspRequest() throws Exception {
         try (TcpLoopbackRaopServer server = new TcpLoopbackRaopServer()) {
             RaopStreamingClient sender = new RaopStreamingClient(

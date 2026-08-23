@@ -72,4 +72,19 @@ public final class DlnaDeviceDescriptionParserTest {
 
         assertNull(description.avTransportControlUri());
     }
+
+    @Test
+    public void rejectsMalformedServiceTypeSuffix() throws Exception {
+        String xml = "<root><device>"
+                + "<deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>"
+                + "<friendlyName>Malformed Renderer</friendlyName><serviceList>"
+                + "<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1&quot; bad</serviceType>"
+                + "<controlURL>/av</controlURL></service></serviceList></device></root>";
+
+        DlnaRendererDescription description = DlnaDeviceDescriptionParser.parse(
+                xml, new URI("http://192.168.1.8/root.xml"));
+
+        assertNull(description.avTransportControlUri());
+        assertEquals("", description.avTransportServiceType());
+    }
 }

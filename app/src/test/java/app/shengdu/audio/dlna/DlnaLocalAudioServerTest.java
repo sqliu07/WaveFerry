@@ -8,6 +8,7 @@ import app.shengdu.audio.format.AudioStreamFormat;
 import app.shengdu.audio.format.SampleFormat;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
@@ -15,6 +16,8 @@ import java.net.Inet6Address;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.junit.Test;
 
@@ -88,7 +91,7 @@ public final class DlnaLocalAudioServerTest {
         byte[] jpeg = new byte[]{(byte) 0xff, (byte) 0xd8, 1, 2, (byte) 0xff, (byte) 0xd9};
         URI audioUri = server.start();
         server.updateArtwork(jpeg);
-        URI artworkUri = server.artworkUri(java.util.Arrays.hashCode(jpeg));
+        URI artworkUri = server.artworkUri("track-1".hashCode());
 
         try (Socket audioSocket = new Socket(audioUri.getHost(), audioUri.getPort())) {
             audioSocket.setSoTimeout(1_000);
@@ -103,7 +106,63 @@ public final class DlnaLocalAudioServerTest {
                 String headers = readHeaders(input);
                 assertTrue(headers.startsWith("HTTP/1.1 200 OK"));
                 assertTrue(headers.contains("Content-Type: image/jpeg"));
+                assertTrue(headers.contains("Cache-Control: no-cache, no-store, must-revalidate"));
                 assertTrue(headers.contains("DLNA.ORG_PN=JPEG_SM"));
+                assertArrayEquals(jpeg, input.readNBytes(jpeg.length));
+            }
+        } finally {
+            server.close();
+        }
+    }
+
+    @Test
+    public void waitsBrieflyForArtworkThatArrivesAfterTheRendererRequest() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        DlnaLocalAudioServer server = new DlnaLocalAudioServer(
+                loopback, new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE));
+        server.start();
+        URI artworkUri = server.artworkUri("track-late-artwork".hashCode());
+
+        try (Socket artworkSocket = new Socket(artworkUri.getHost(), artworkUri.getPort())) {
+            artworkSocket.setSoTimeout(1_000);
+            writeRequest(artworkSocket, "GET", artworkUri);
+            Thread.sleep(50L);
+            byte[] jpeg = new byte[]{(byte) 0xff, (byte) 0xd8, 4, 5, (byte) 0xff, (byte) 0xd9};
+            server.updateArtwork(jpeg);
+
+            InputStream input = artworkSocket.getInputStream();
+            String headers = readHeaders(input);
+            assertTrue(headers.startsWith("HTTP/1.1 200 OK"));
+            assertArrayEquals(jpeg, input.readNBytes(jpeg.length));
+        } finally {
+            server.close();
+        }
+    }
+
+    @Test
+    public void missingArtworkResponseIsNotCachedBeforeTheSameUriBecomesAvailable() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        DlnaLocalAudioServer server = new DlnaLocalAudioServer(
+                loopback, new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE));
+        server.start();
+        URI artworkUri = server.artworkUri("track-artwork-timeout".hashCode());
+
+        try {
+            try (Socket firstRequest = new Socket(artworkUri.getHost(), artworkUri.getPort())) {
+                firstRequest.setSoTimeout(1_000);
+                writeRequest(firstRequest, "GET", artworkUri);
+                String headers = readHeaders(firstRequest.getInputStream());
+                assertTrue(headers.startsWith("HTTP/1.1 404 Not Found"));
+                assertTrue(headers.contains("Cache-Control: no-cache, no-store, must-revalidate"));
+            }
+
+            byte[] jpeg = new byte[]{(byte) 0xff, (byte) 0xd8, 6, 7, (byte) 0xff, (byte) 0xd9};
+            server.updateArtwork(jpeg);
+            try (Socket retry = new Socket(artworkUri.getHost(), artworkUri.getPort())) {
+                retry.setSoTimeout(1_000);
+                writeRequest(retry, "GET", artworkUri);
+                InputStream input = retry.getInputStream();
+                assertTrue(readHeaders(input).startsWith("HTTP/1.1 200 OK"));
                 assertArrayEquals(jpeg, input.readNBytes(jpeg.length));
             }
         } finally {
@@ -134,6 +193,216 @@ public final class DlnaLocalAudioServerTest {
             assertTrue(headers.contains("Content-Range: bytes 176444-"));
             assertArrayEquals(currentPcm, input.readNBytes(currentPcm.length));
         } finally {
+            server.close();
+        }
+    }
+
+    @Test
+    public void dropsOldestBufferedPcmInsteadOfAccumulatingPlaybackLag() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        DlnaLocalAudioServer server = new DlnaLocalAudioServer(
+                loopback, new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE));
+        URI uri = server.start();
+        server.writePcm(new byte[]{1, 1, 1, 1}, 0, 4);
+        server.writePcm(new byte[]{2, 2, 2, 2}, 0, 4);
+        server.writePcm(new byte[]{3, 3, 3, 3}, 0, 4);
+        server.writePcm(new byte[]{4, 4, 4, 4}, 0, 4);
+
+        try (Socket socket = new Socket(uri.getHost(), uri.getPort())) {
+            socket.setSoTimeout(1_000);
+            writeRequest(socket, "GET", uri);
+            InputStream input = socket.getInputStream();
+            readHeaders(input);
+            input.readNBytes(44);
+
+            assertArrayEquals(
+                    new byte[]{2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4},
+                    input.readNBytes(12));
+        } finally {
+            server.close();
+        }
+    }
+
+    @Test
+    public void rejectsARequestWithTooManyHeaders() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        DlnaLocalAudioServer server = new DlnaLocalAudioServer(
+                loopback, new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE));
+        URI uri = server.start();
+
+        try (Socket socket = new Socket(uri.getHost(), uri.getPort())) {
+            socket.setSoTimeout(1_000);
+            StringBuilder request = new StringBuilder("GET ")
+                    .append(uri.getRawPath())
+                    .append(" HTTP/1.1\r\n");
+            for (int index = 0; index < 40; index++) {
+                request.append("X-Test-").append(index).append(": value\r\n");
+            }
+            request.append("\r\n");
+            socket.getOutputStream().write(request.toString().getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().flush();
+
+            assertEquals(-1, socket.getInputStream().read());
+        } finally {
+            server.close();
+        }
+    }
+
+    @Test
+    public void incompleteRequestIsClosedAfterTheReadDeadline() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        DlnaLocalAudioServer server = new DlnaLocalAudioServer(
+                loopback, new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE));
+        URI uri = server.start();
+
+        try (Socket socket = new Socket(uri.getHost(), uri.getPort())) {
+            socket.setSoTimeout(DlnaLocalAudioServer.HTTP_REQUEST_TIMEOUT_MS + 1_000);
+            socket.getOutputStream().write(("GET " + uri.getRawPath())
+                    .getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().flush();
+
+            assertEquals(-1, socket.getInputStream().read());
+        } finally {
+            server.close();
+        }
+    }
+
+    @Test
+    public void concurrentMissingArtworkRequestsDoNotStarveTheAudioStream() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        DlnaLocalAudioServer server = new DlnaLocalAudioServer(
+                loopback, new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE));
+        URI audioUri = server.start();
+        URI artworkUri = server.artworkUri("track-parallel-artwork".hashCode());
+        List<Socket> artworkRequests = new ArrayList<>();
+
+        try {
+            for (int index = 0; index < 4; index++) {
+                Socket artwork = new Socket(artworkUri.getHost(), artworkUri.getPort());
+                artworkRequests.add(artwork);
+                writeRequest(artwork, "GET", artworkUri);
+            }
+            Thread.sleep(75L);
+
+            try (Socket audio = new Socket(audioUri.getHost(), audioUri.getPort())) {
+                audio.setSoTimeout(200);
+                writeRequest(audio, "GET", audioUri);
+                InputStream input = audio.getInputStream();
+                assertTrue(readHeaders(input).startsWith("HTTP/1.1 200 OK"));
+                assertEquals(48, input.readNBytes(48).length);
+            }
+        } finally {
+            for (Socket artwork : artworkRequests) {
+                artwork.close();
+            }
+            server.close();
+        }
+    }
+
+    @Test
+    public void fourIncompleteArtworkRequestsDoNotBlockTheAudioStream() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        DlnaLocalAudioServer server = new DlnaLocalAudioServer(
+                loopback, new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE));
+        URI audioUri = server.start();
+        URI artworkUri = server.artworkUri("track-slow-artwork".hashCode());
+        List<Socket> incompleteRequests = new ArrayList<>();
+
+        try {
+            for (int index = 0; index < 4; index++) {
+                Socket artwork = new Socket(artworkUri.getHost(), artworkUri.getPort());
+                incompleteRequests.add(artwork);
+                artwork.getOutputStream().write(("GET " + artworkUri.getRawPath()
+                        + " HTTP/1.1\r\nHost: " + artworkUri.getHost())
+                        .getBytes(StandardCharsets.US_ASCII));
+                artwork.getOutputStream().flush();
+            }
+            Thread.sleep(75L);
+
+            try (Socket audio = new Socket(audioUri.getHost(), audioUri.getPort())) {
+                audio.setSoTimeout(300);
+                writeRequest(audio, "GET", audioUri);
+                InputStream input = audio.getInputStream();
+                assertTrue(readHeaders(input).startsWith("HTTP/1.1 200 OK"));
+                assertEquals(48, input.readNBytes(48).length);
+            }
+        } finally {
+            for (Socket request : incompleteRequests) {
+                request.close();
+            }
+            server.close();
+        }
+    }
+
+    @Test
+    public void rejectsConnectionsBeyondTheBoundedPendingQueue() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        DlnaLocalAudioServer server = new DlnaLocalAudioServer(
+                loopback, new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE));
+        URI uri = server.start();
+        List<Socket> occupied = new ArrayList<>();
+
+        try {
+            int acceptedCapacity = DlnaLocalAudioServer.CONNECTION_WORKER_COUNT
+                    + DlnaLocalAudioServer.MAX_PENDING_CONNECTIONS;
+            for (int index = 0; index < acceptedCapacity; index++) {
+                Socket socket = new Socket(uri.getHost(), uri.getPort());
+                occupied.add(socket);
+                socket.getOutputStream().write(("GET " + uri.getRawPath())
+                        .getBytes(StandardCharsets.US_ASCII));
+                socket.getOutputStream().flush();
+            }
+            Thread.sleep(100L);
+
+            try (Socket overflow = new Socket(uri.getHost(), uri.getPort())) {
+                overflow.setSoTimeout(500);
+                overflow.getOutputStream().write(("GET " + uri.getRawPath())
+                        .getBytes(StandardCharsets.US_ASCII));
+                overflow.getOutputStream().flush();
+                assertEquals(-1, overflow.getInputStream().read());
+            }
+        } finally {
+            for (Socket socket : occupied) {
+                socket.close();
+            }
+            server.close();
+        }
+    }
+
+    @Test
+    public void closeClosesRunningAndQueuedConnections() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        DlnaLocalAudioServer server = new DlnaLocalAudioServer(
+                loopback, new AudioStreamFormat(44_100, 2, SampleFormat.PCM16_LE));
+        URI uri = server.start();
+        List<Socket> accepted = new ArrayList<>();
+
+        try {
+            int acceptedCapacity = DlnaLocalAudioServer.CONNECTION_WORKER_COUNT
+                    + DlnaLocalAudioServer.MAX_PENDING_CONNECTIONS;
+            for (int index = 0; index < acceptedCapacity; index++) {
+                Socket socket = new Socket(uri.getHost(), uri.getPort());
+                socket.setSoTimeout(500);
+                accepted.add(socket);
+                socket.getOutputStream().write(("GET " + uri.getRawPath())
+                        .getBytes(StandardCharsets.US_ASCII));
+                socket.getOutputStream().flush();
+            }
+            Thread.sleep(100L);
+
+            server.close();
+
+            for (Socket socket : accepted) {
+                try {
+                    assertEquals(-1, socket.getInputStream().read());
+                } catch (IOException expected) {
+                    // A peer close may surface as EOF or a connection reset.
+                }
+            }
+        } finally {
+            for (Socket socket : accepted) {
+                socket.close();
+            }
             server.close();
         }
     }

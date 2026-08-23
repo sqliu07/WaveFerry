@@ -3,20 +3,24 @@ package app.shengdu.audio.dlna;
 import app.shengdu.audio.format.AudioStreamFormat;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /** Sends captured PCM to a MediaRenderer through a local WAV endpoint and AVTransport. */
 public final class DlnaStreamingClient implements AutoCloseable {
-    private static final long TRANSITION_SETTLE_TIMEOUT_MS = 3_000L;
-    private static final long TRANSITION_RETRY_INTERVAL_MS = 250L;
+    private static final long TRANSITION_RETRY_TIMEOUT_MS = 3_000L;
+    private static final long TRANSITION_RETRY_INITIAL_MS = 100L;
+    private static final long TRANSITION_RETRY_MAX_MS = 400L;
     private static final long REMOTE_STATE_POLL_INTERVAL_MS = 750L;
+    private static final long POSITION_SYNC_DELAY_MS = 150L;
 
     public interface RemotePlaybackListener {
         void onRemotePlaybackRequested(boolean playing);
@@ -25,19 +29,26 @@ public final class DlnaStreamingClient implements AutoCloseable {
     private final DlnaLocalAudioServer audioServer;
     private final DlnaAvTransportClient avTransport;
     private final RemotePlaybackListener remotePlaybackListener;
+    private final Object metadataCacheLock = new Object();
     private final ScheduledExecutorService remoteStatePoller =
             Executors.newSingleThreadScheduledExecutor(runnable -> {
                 Thread thread = new Thread(runnable, "dlna-transport-state");
                 thread.setDaemon(true);
                 return thread;
             });
+    private volatile boolean prepared;
     private volatile boolean started;
+    private volatile boolean closed;
+    private boolean uriApplied;
     private volatile boolean localTransition;
     private volatile String lastObservedTransportState = "";
     private final AtomicLong localTransitionRevision = new AtomicLong();
     private URI mediaUri;
-    private String metadataKey = "";
+    private String appliedMetadataKey = "";
     private String lastTrackKey = "";
+    private long pendingResumePositionMs;
+    private final AtomicLong metadataRevision = new AtomicLong();
+    private volatile PendingMetadata pendingMetadata;
 
     public DlnaStreamingClient(
             InetAddress receiverAddress,
@@ -62,45 +73,75 @@ public final class DlnaStreamingClient implements AutoCloseable {
                 remotePlaybackListener, "remotePlaybackListener");
     }
 
-    public synchronized void start() throws IOException {
+    /** Starts the local endpoint and verifies that the renderer still answers AVTransport. */
+    public synchronized void prepare() throws IOException {
+        if (prepared) {
+            return;
+        }
+        try {
+            mediaUri = audioServer.start();
+            // Do not assign or play the URI before Android capture is running. Some TVs
+            // immediately pull and buffer the HTTP stream from SetAVTransportURI.
+            try {
+                lastObservedTransportState = normalizeState(avTransport.transportState());
+            } catch (IOException error) {
+                // A SOAP fault still proves that the advertised AVTransport endpoint is
+                // reachable. Some legacy renderers reject GetTransportInfo but accept
+                // SetAVTransportURI and Play, so defer that compatibility decision.
+                if (!DlnaAvTransportClient.isUpnpFault(error)) {
+                    throw error;
+                }
+                lastObservedTransportState = "";
+            }
+            prepared = true;
+        } catch (IOException error) {
+            mediaUri = null;
+            audioServer.close();
+            throw error;
+        }
+    }
+
+    /** Assigns the live URI after AudioRecord starts and mirrors the cached source play state. */
+    public synchronized void startPlayback() throws IOException {
         if (started) {
             return;
+        }
+        if (!prepared || mediaUri == null) {
+            throw new IllegalStateException("DLNA renderer has not been prepared");
         }
         localTransitionRevision.incrementAndGet();
         localTransition = true;
         try {
-            mediaUri = audioServer.start();
-            stopCurrentTransportIfNeeded();
-            runWhenTransitionReady(() ->
-                    avTransport.setUri(mediaUri, DlnaLiveAudioMetadata.didlLite(mediaUri)));
-            String state = waitForTransportToSettle();
-            if (!isPlaying(state)) {
-                playWhenReady();
-            }
+            PendingMetadata metadata = applyLatestTransportMetadata();
             started = true;
-            lastObservedTransportState = "PLAYING";
+            appliedMetadataKey = metadata == null ? "" : metadata.transportKey();
+            lastTrackKey = metadata == null ? "" : metadata.trackKey;
             remoteStatePoller.scheduleWithFixedDelay(
                     this::pollRemoteTransportState,
                     REMOTE_STATE_POLL_INTERVAL_MS,
                     REMOTE_STATE_POLL_INTERVAL_MS,
                     TimeUnit.MILLISECONDS);
-        } catch (IOException error) {
-            mediaUri = null;
-            audioServer.close();
-            throw error;
         } finally {
             localTransition = false;
         }
     }
 
     public void writePcm(byte[] buffer, int offset, int byteCount) {
-        // Buffer a short pre-roll even while SetAVTransportURI is in progress.
+        // Capture starts before SetAVTransportURI so the renderer receives current audio
+        // as soon as it opens the HTTP stream. The bounded queue drops stale pre-roll.
         audioServer.writePcm(buffer, offset, byteCount);
+    }
+
+    /** Makes late artwork available to an in-flight renderer request without SOAP I/O. */
+    public void cacheArtwork(byte[] artworkJpeg) {
+        audioServer.updateArtwork(artworkJpeg);
     }
 
     public synchronized void pause() throws IOException {
         if (started) {
             localTransitionRevision.incrementAndGet();
+            avTransport.cancelPendingSeek();
+            avTransport.cancelPendingTransportPoll();
             localTransition = true;
             try {
                 avTransport.pause();
@@ -114,10 +155,17 @@ public final class DlnaStreamingClient implements AutoCloseable {
     public synchronized void resume() throws IOException {
         if (started) {
             localTransitionRevision.incrementAndGet();
+            avTransport.cancelPendingSeek();
+            avTransport.cancelPendingTransportPoll();
             localTransition = true;
             try {
                 playWhenReady();
                 lastObservedTransportState = "PLAYING";
+                long resumePositionMs = pendingResumePositionMs;
+                pendingResumePositionMs = 0L;
+                if (resumePositionMs > 0) {
+                    schedulePositionSync(resumePositionMs);
+                }
             } finally {
                 localTransition = false;
             }
@@ -125,7 +173,7 @@ public final class DlnaStreamingClient implements AutoCloseable {
     }
 
     /** Refreshes the renderer's now-playing fields without affecting the capture thread. */
-    public synchronized void updateMetadata(
+    public void updateMetadata(
             String title,
             String artist,
             String album,
@@ -134,72 +182,218 @@ public final class DlnaStreamingClient implements AutoCloseable {
             long positionMs,
             byte[] artworkJpeg,
             boolean shouldPlay) throws IOException {
-        if (!started || mediaUri == null || trackKey == null || trackKey.isBlank()) {
+        long revision = cacheMetadata(
+                title,
+                artist,
+                album,
+                trackKey,
+                durationMs,
+                positionMs,
+                artworkJpeg,
+                shouldPlay);
+        applyCachedMetadata(revision);
+    }
+
+    /** Applies a previously cached snapshot unless a newer callback has superseded it. */
+    public synchronized void applyCachedMetadata(long revision) throws IOException {
+        PendingMetadata next = pendingMetadata;
+        if (revision <= 0L || next == null || next.revision != revision) {
             return;
         }
-        int artworkHash = Arrays.hashCode(artworkJpeg);
-        String nextMetadataKey = trackKey + '\n' + durationMs + '\n' + Integer.toHexString(artworkHash);
-        if (nextMetadataKey.equals(metadataKey)) {
+        if (!started || mediaUri == null || next.transportKey().equals(appliedMetadataKey)) {
+            // Cache metadata received between receiver preparation and capture startup.
             return;
         }
 
-        boolean trackChanged = !trackKey.equals(lastTrackKey);
-        audioServer.updateArtwork(artworkJpeg);
-        URI artworkUri = artworkJpeg == null || artworkJpeg.length == 0
-                ? null
-                : audioServer.artworkUri(artworkHash);
+        boolean trackChanged = !next.trackKey.equals(lastTrackKey);
         if (trackChanged) {
             // Do not let the tail of the previous track become the new track's pre-roll.
             audioServer.discardBufferedPcm();
         }
 
         localTransitionRevision.incrementAndGet();
+        avTransport.cancelPendingSeek();
+        avTransport.cancelPendingTransportPoll();
         localTransition = true;
         try {
-            stopCurrentTransportIfNeeded();
-            runWhenTransitionReady(() -> avTransport.setUri(
-                    mediaUri,
-                    DlnaLiveAudioMetadata.didlLite(
-                            mediaUri, title, artist, album, artworkUri, durationMs)));
-            String state = waitForTransportToSettle();
-            if (shouldPlay && !isPlaying(state)) {
-                playWhenReady();
-            }
-            if (shouldPlay && positionMs > 0) {
-                try {
-                    avTransport.seekTo(positionMs);
-                    waitForTransportToSettle();
-                } catch (IOException ignored) {
-                    // REL_TIME seek is optional. Duration metadata still fixes the
-                    // renderer's total length when exact position sync is unavailable.
-                }
-            }
-            lastObservedTransportState = shouldPlay ? "PLAYING" : normalizeState(state);
+            PendingMetadata applied = applyLatestTransportMetadata();
+            appliedMetadataKey = applied == null ? "" : applied.transportKey();
+            lastTrackKey = applied == null ? "" : applied.trackKey;
         } finally {
             localTransition = false;
         }
-        metadataKey = nextMetadataKey;
-        lastTrackKey = trackKey;
+    }
+
+    /** Stores metadata immediately without issuing SOAP, so playback startup can use it. */
+    public long cacheMetadata(
+            String title,
+            String artist,
+            String album,
+            String trackKey,
+            long durationMs,
+            long positionMs,
+            byte[] artworkJpeg,
+            boolean shouldPlay) {
+        if (trackKey == null || trackKey.isBlank()) {
+            return 0L;
+        }
+        synchronized (metadataCacheLock) {
+            if (closed) {
+                return 0L;
+            }
+            long revision = metadataRevision.incrementAndGet();
+            cacheArtwork(artworkJpeg);
+            pendingMetadata = new PendingMetadata(
+                    revision,
+                    title,
+                    artist,
+                    album,
+                    trackKey,
+                    durationMs,
+                    positionMs,
+                    artworkJpeg,
+                    shouldPlay);
+            return revision;
+        }
     }
 
     @Override
-    public synchronized void close() {
+    public void close() {
+        synchronized (metadataCacheLock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            metadataRevision.incrementAndGet();
+            pendingMetadata = null;
+        }
+        avTransport.closeControlActions();
         localTransitionRevision.incrementAndGet();
         localTransition = true;
-        started = false;
+        avTransport.cancelPendingSeek();
+        avTransport.cancelPendingTransportPoll();
         remoteStatePoller.shutdownNow();
-        if (mediaUri != null) {
+        boolean stopRenderer;
+        synchronized (this) {
+            prepared = false;
+            started = false;
+            stopRenderer = uriApplied;
+            uriApplied = false;
+            mediaUri = null;
+            appliedMetadataKey = "";
+            lastTrackKey = "";
+            pendingResumePositionMs = 0L;
+        }
+        if (stopRenderer) {
             try {
-                avTransport.stop();
+                avTransport.stopForTeardown();
             } catch (IOException ignored) {
                 // The renderer may already be offline.
             }
         }
-        mediaUri = null;
-        metadataKey = "";
-        lastTrackKey = "";
         audioServer.close();
         localTransition = false;
+    }
+
+    private PendingMetadata applyLatestTransportMetadata() throws IOException {
+        stopCurrentTransportIfNeeded();
+        // Snapshot after Stop: metadata callbacks remain memory-only and can still publish
+        // a newer song or late artwork while a slow renderer completes the transition.
+        PendingMetadata metadata = pendingMetadata;
+        URI artworkUri = metadata == null || !metadata.hasArtwork
+                ? null
+                : audioServer.artworkUri(metadata.artworkHash);
+        String didl = metadata == null
+                ? DlnaLiveAudioMetadata.didlLite(mediaUri)
+                : DlnaLiveAudioMetadata.didlLite(
+                        mediaUri,
+                        metadata.title,
+                        metadata.artist,
+                        metadata.album,
+                        artworkUri,
+                        metadata.durationMs);
+        runWhenTransitionReady(() -> avTransport.setUri(mediaUri, didl));
+        uriApplied = true;
+        boolean shouldPlay = metadata == null || metadata.shouldPlay;
+        if (shouldPlay) {
+            pendingResumePositionMs = 0L;
+            playWhenReady();
+        }
+        lastObservedTransportState = shouldPlay ? "PLAYING" : "STOPPED";
+        if (shouldPlay && metadata != null && metadata.positionMs > 0) {
+            schedulePositionSync(metadata.positionMs);
+        } else if (!shouldPlay && metadata != null) {
+            pendingResumePositionMs = metadata.positionMs;
+        }
+        return metadata;
+    }
+
+    private void schedulePositionSync(long positionMs) {
+        if (positionMs <= 0) {
+            return;
+        }
+        long expectedRevision = localTransitionRevision.get();
+        long deadlineNanos = System.nanoTime()
+                + TimeUnit.MILLISECONDS.toNanos(TRANSITION_RETRY_TIMEOUT_MS);
+        schedulePositionSyncAttempt(
+                expectedRevision,
+                positionMs,
+                POSITION_SYNC_DELAY_MS,
+                TRANSITION_RETRY_INITIAL_MS,
+                deadlineNanos);
+    }
+
+    private void schedulePositionSyncAttempt(
+            long expectedRevision,
+            long positionMs,
+            long scheduleDelayMs,
+            long retryDelayMs,
+            long deadlineNanos) {
+        try {
+            remoteStatePoller.schedule(
+                    () -> syncPositionWhenReady(
+                            expectedRevision, positionMs, retryDelayMs, deadlineNanos),
+                    scheduleDelayMs,
+                    TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+            // Session teardown won the race; no renderer remains to synchronize.
+        }
+    }
+
+    private void syncPositionWhenReady(
+            long expectedRevision,
+            long positionMs,
+            long retryDelayMs,
+            long deadlineNanos) {
+        long seekRevision;
+        synchronized (this) {
+            if (!started
+                    || localTransition
+                    || expectedRevision != localTransitionRevision.get()) {
+                return;
+            }
+            seekRevision = avTransport.currentSeekRevision();
+        }
+        boolean retry = false;
+        try {
+            avTransport.seekTo(positionMs, seekRevision);
+        } catch (IOException error) {
+            // REL_TIME is optional; audio streaming must continue without it.
+            retry = DlnaAvTransportClient.isTransitionNotAvailable(error)
+                    && System.nanoTime() < deadlineNanos;
+        }
+        synchronized (this) {
+            if (retry
+                    && started
+                    && expectedRevision == localTransitionRevision.get()) {
+                schedulePositionSyncAttempt(
+                        expectedRevision,
+                        positionMs,
+                        retryDelayMs,
+                        Math.min(TRANSITION_RETRY_MAX_MS, retryDelayMs * 2L),
+                        deadlineNanos);
+            }
+        }
     }
 
     private void pollRemoteTransportState() {
@@ -209,7 +403,7 @@ public final class DlnaStreamingClient implements AutoCloseable {
         long revision = localTransitionRevision.get();
         final String state;
         try {
-            state = normalizeState(avTransport.transportState());
+            state = normalizeState(avTransport.transportStateForPolling());
         } catch (IOException | RuntimeException ignored) {
             return;
         }
@@ -256,7 +450,8 @@ public final class DlnaStreamingClient implements AutoCloseable {
 
     private void runWhenTransitionReady(TransportAction action) throws IOException {
         IOException lastTransitionError = null;
-        long deadlineNanos = System.nanoTime() + TRANSITION_SETTLE_TIMEOUT_MS * 1_000_000L;
+        long retryDelayMs = TRANSITION_RETRY_INITIAL_MS;
+        long deadlineNanos = System.nanoTime() + TRANSITION_RETRY_TIMEOUT_MS * 1_000_000L;
         do {
             try {
                 action.run();
@@ -266,7 +461,8 @@ public final class DlnaStreamingClient implements AutoCloseable {
                     throw error;
                 }
                 lastTransitionError = error;
-                sleepBeforeRetry();
+                sleepBeforeRetry(retryDelayMs);
+                retryDelayMs = Math.min(TRANSITION_RETRY_MAX_MS, retryDelayMs * 2L);
             }
         } while (System.nanoTime() < deadlineNanos);
         String finalState = readTransportState();
@@ -283,7 +479,6 @@ public final class DlnaStreamingClient implements AutoCloseable {
         }
         try {
             avTransport.stop();
-            waitForTransportToSettle();
         } catch (IOException error) {
             // A live-TV input often reports 701 for Stop but can still accept a new URI.
             if (!DlnaAvTransportClient.isTransitionNotAvailable(error)) {
@@ -294,7 +489,8 @@ public final class DlnaStreamingClient implements AutoCloseable {
 
     private void playWhenReady() throws IOException {
         IOException lastTransitionError = null;
-        long deadlineNanos = System.nanoTime() + TRANSITION_SETTLE_TIMEOUT_MS * 1_000_000L;
+        long retryDelayMs = TRANSITION_RETRY_INITIAL_MS;
+        long deadlineNanos = System.nanoTime() + TRANSITION_RETRY_TIMEOUT_MS * 1_000_000L;
         do {
             try {
                 avTransport.play();
@@ -307,7 +503,8 @@ public final class DlnaStreamingClient implements AutoCloseable {
                 if (isPlaying(readTransportState())) {
                     return;
                 }
-                sleepBeforeRetry();
+                sleepBeforeRetry(retryDelayMs);
+                retryDelayMs = Math.min(TRANSITION_RETRY_MAX_MS, retryDelayMs * 2L);
             }
         } while (System.nanoTime() < deadlineNanos);
         // Some LG renderers return 701 after accepting Play. A final state read
@@ -318,24 +515,6 @@ public final class DlnaStreamingClient implements AutoCloseable {
                     + "，电视状态：" + (finalState.isEmpty() ? "未知" : finalState),
                     lastTransitionError);
         }
-    }
-
-    private String waitForTransportToSettle() {
-        String lastState = "";
-        long deadlineNanos = System.nanoTime() + TRANSITION_SETTLE_TIMEOUT_MS * 1_000_000L;
-        while (System.nanoTime() < deadlineNanos) {
-            try {
-                lastState = avTransport.transportState();
-                if (!"TRANSITIONING".equalsIgnoreCase(lastState)) {
-                    return lastState;
-                }
-            } catch (IOException ignored) {
-                // Some legacy renderers omit GetTransportInfo; the Play retry remains enough.
-                return "";
-            }
-            sleepBeforeRetry();
-        }
-        return lastState;
     }
 
     private String readTransportState() {
@@ -350,17 +529,61 @@ public final class DlnaStreamingClient implements AutoCloseable {
         return "PLAYING".equalsIgnoreCase(state);
     }
 
-    private static void sleepBeforeRetry() {
+    private static void sleepBeforeRetry(long delayMs) throws IOException {
         try {
-            Thread.sleep(TRANSITION_RETRY_INTERVAL_MS);
+            Thread.sleep(delayMs);
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
+            InterruptedIOException interrupted =
+                    new InterruptedIOException("DLNA transition retry interrupted");
+            interrupted.initCause(error);
+            throw interrupted;
         }
     }
 
     @FunctionalInterface
     private interface TransportAction {
         void run() throws IOException;
+    }
+
+    private static final class PendingMetadata {
+        private final long revision;
+        private final String title;
+        private final String artist;
+        private final String album;
+        private final String trackKey;
+        private final long durationMs;
+        private final long positionMs;
+        private final boolean hasArtwork;
+        private final int artworkHash;
+        private final boolean shouldPlay;
+
+        private PendingMetadata(
+                long revision,
+                String title,
+                String artist,
+                String album,
+                String trackKey,
+                long durationMs,
+                long positionMs,
+                byte[] artworkJpeg,
+                boolean shouldPlay) {
+            this.revision = revision;
+            this.title = title;
+            this.artist = artist;
+            this.album = album;
+            this.trackKey = trackKey;
+            this.durationMs = durationMs;
+            this.positionMs = positionMs;
+            this.hasArtwork = artworkJpeg != null && artworkJpeg.length > 0;
+            this.artworkHash = hasArtwork ? Arrays.hashCode(artworkJpeg) : 0;
+            this.shouldPlay = shouldPlay;
+        }
+
+        private String transportKey() {
+            return trackKey + '\n' + durationMs + '\n'
+                    + (hasArtwork ? Integer.toHexString(artworkHash) : "-");
+        }
     }
 
     enum RemoteCommand {

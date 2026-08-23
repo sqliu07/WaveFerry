@@ -3,18 +3,38 @@ package app.shengdu.audio.dlna;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** Minimal UPnP AVTransport controller for a single MediaRenderer instance. */
 final class DlnaAvTransportClient {
     private static final int MAX_FAULT_RESPONSE_BYTES = 16 * 1024;
+    private static final int CONTROL_CONNECT_TIMEOUT_MS = 3_000;
+    private static final int CONTROL_READ_TIMEOUT_MS = 5_000;
+    private static final int OPTIONAL_CONNECT_TIMEOUT_MS = 750;
+    private static final int OPTIONAL_READ_TIMEOUT_MS = 1_000;
+    private static final int TEARDOWN_CONNECT_TIMEOUT_MS = 500;
+    private static final int TEARDOWN_READ_TIMEOUT_MS = 750;
 
     private final URI controlUri;
     private final String serviceType;
+    private final AtomicBoolean controlActionsClosed = new AtomicBoolean();
+    private final AtomicLong controlRevision = new AtomicLong();
+    private final AtomicReference<HttpURLConnection> pendingControlAction = new AtomicReference<>();
+    private final AtomicLong seekRevision = new AtomicLong();
+    private final AtomicReference<HttpURLConnection> pendingSeek = new AtomicReference<>();
+    private final AtomicLong transportPollRevision = new AtomicLong();
+    private final AtomicReference<HttpURLConnection> pendingTransportPoll = new AtomicReference<>();
 
     DlnaAvTransportClient(URI controlUri, String serviceType) {
         this.controlUri = Objects.requireNonNull(controlUri, "controlUri");
@@ -40,14 +60,86 @@ final class DlnaAvTransportClient {
         invokeAction("Stop", "<InstanceID>0</InstanceID>");
     }
 
+    void stopForTeardown() throws IOException {
+        invokeAction(
+                "Stop",
+                "<InstanceID>0</InstanceID>",
+                TEARDOWN_CONNECT_TIMEOUT_MS,
+                TEARDOWN_READ_TIMEOUT_MS,
+                null,
+                null);
+    }
+
     void seekTo(long positionMs) throws IOException {
-        invokeAction("Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit>"
-                + "<Target>" + DlnaLiveAudioMetadata.timeValue(positionMs) + "</Target>");
+        seekTo(positionMs, currentSeekRevision());
+    }
+
+    void seekTo(long positionMs, long expectedSeekRevision) throws IOException {
+        invokeAction(
+                "Seek",
+                "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit>"
+                        + "<Target>" + DlnaLiveAudioMetadata.timeValue(positionMs) + "</Target>",
+                OPTIONAL_CONNECT_TIMEOUT_MS,
+                OPTIONAL_READ_TIMEOUT_MS,
+                pendingSeek,
+                () -> seekRevision.get() == expectedSeekRevision);
+    }
+
+    long currentSeekRevision() {
+        return seekRevision.get();
+    }
+
+    void cancelPendingSeek() {
+        seekRevision.incrementAndGet();
+        HttpURLConnection connection = pendingSeek.getAndSet(null);
+        if (connection != null) {
+            connection.disconnect();
+        }
     }
 
     String transportState() throws IOException {
-        return xmlElement(invoke("GetTransportInfo", "<InstanceID>0</InstanceID>", true),
+        long expectedRevision = controlRevision.get();
+        return xmlElement(invoke(
+                "GetTransportInfo",
+                "<InstanceID>0</InstanceID>",
+                true,
+                CONTROL_CONNECT_TIMEOUT_MS,
+                CONTROL_READ_TIMEOUT_MS,
+                pendingControlAction,
+                () -> !controlActionsClosed.get()
+                        && controlRevision.get() == expectedRevision),
                 "CurrentTransportState");
+    }
+
+    String transportStateForPolling() throws IOException {
+        long expectedRevision = transportPollRevision.get();
+        return xmlElement(invoke(
+                "GetTransportInfo",
+                "<InstanceID>0</InstanceID>",
+                true,
+                OPTIONAL_CONNECT_TIMEOUT_MS,
+                OPTIONAL_READ_TIMEOUT_MS,
+                pendingTransportPoll,
+                () -> !controlActionsClosed.get()
+                        && transportPollRevision.get() == expectedRevision),
+                "CurrentTransportState");
+    }
+
+    void cancelPendingTransportPoll() {
+        transportPollRevision.incrementAndGet();
+        HttpURLConnection connection = pendingTransportPoll.getAndSet(null);
+        if (connection != null) {
+            connection.disconnect();
+        }
+    }
+
+    void closeControlActions() {
+        controlActionsClosed.set(true);
+        controlRevision.incrementAndGet();
+        HttpURLConnection connection = pendingControlAction.getAndSet(null);
+        if (connection != null) {
+            connection.disconnect();
+        }
     }
 
     static boolean isTransitionNotAvailable(IOException error) {
@@ -55,9 +147,39 @@ final class DlnaAvTransportClient {
                 && ((ControlException) error).upnpErrorCode == 701;
     }
 
+    static boolean isUpnpFault(IOException error) {
+        return error instanceof ControlException
+                && ((ControlException) error).upnpErrorCode != 0;
+    }
+
     private void invokeAction(String action, String body) throws IOException {
+        long expectedRevision = controlRevision.get();
+        invokeAction(
+                action,
+                body,
+                CONTROL_CONNECT_TIMEOUT_MS,
+                CONTROL_READ_TIMEOUT_MS,
+                pendingControlAction,
+                () -> !controlActionsClosed.get()
+                        && controlRevision.get() == expectedRevision);
+    }
+
+    private void invokeAction(
+            String action,
+            String body,
+            int connectTimeoutMs,
+            int readTimeoutMs,
+            AtomicReference<HttpURLConnection> cancellationSlot,
+            BooleanSupplier cancellationGuard) throws IOException {
         try {
-            invoke(action, body, false);
+            invoke(
+                    action,
+                    body,
+                    false,
+                    connectTimeoutMs,
+                    readTimeoutMs,
+                    cancellationSlot,
+                    cancellationGuard);
         } catch (ControlException error) {
             throw error;
         } catch (IOException error) {
@@ -68,23 +190,39 @@ final class DlnaAvTransportClient {
         }
     }
 
-    private String invoke(String action, String body, boolean readResponseBody) throws IOException {
+    private String invoke(
+            String action,
+            String body,
+            boolean readResponseBody,
+            int connectTimeoutMs,
+            int readTimeoutMs,
+            AtomicReference<HttpURLConnection> cancellationSlot,
+            BooleanSupplier cancellationGuard) throws IOException {
         HttpURLConnection connection = (HttpURLConnection) controlUri.toURL().openConnection();
         connection.setInstanceFollowRedirects(false);
-        connection.setConnectTimeout(5_000);
-        connection.setReadTimeout(10_000);
+        connection.setConnectTimeout(connectTimeoutMs);
+        connection.setReadTimeout(readTimeoutMs);
         connection.setRequestMethod("POST");
         connection.setDoOutput(true);
-        connection.setRequestProperty("User-Agent", "WaveFerry/0.2.0 UPnP/1.0");
+        connection.setRequestProperty("User-Agent", DlnaProtocol.USER_AGENT);
         connection.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
         connection.setRequestProperty("SOAPACTION", "\"" + serviceType + "#" + action + "\"");
         byte[] request = envelope(action, body).getBytes(StandardCharsets.UTF_8);
         connection.setFixedLengthStreamingMode(request.length);
-        try (OutputStream output = connection.getOutputStream()) {
-            output.write(request);
+        if (cancellationSlot != null) {
+            HttpURLConnection previous = cancellationSlot.getAndSet(connection);
+            if (previous != null && previous != connection) {
+                previous.disconnect();
+            }
         }
-        int responseCode = connection.getResponseCode();
         try {
+            if (cancellationGuard != null && !cancellationGuard.getAsBoolean()) {
+                throw new InterruptedIOException("DLNA action was cancelled");
+            }
+            try (OutputStream output = connection.getOutputStream()) {
+                output.write(request);
+            }
+            int responseCode = connection.getResponseCode();
             if (responseCode < 200 || responseCode >= 300) {
                 FaultDetails fault = readFault(connection.getErrorStream());
                 throw new ControlException(action, responseCode, fault);
@@ -96,6 +234,9 @@ final class DlnaAvTransportClient {
             }
             return "";
         } finally {
+            if (cancellationSlot != null) {
+                cancellationSlot.compareAndSet(connection, null);
+            }
             connection.disconnect();
         }
     }
@@ -149,14 +290,12 @@ final class DlnaAvTransportClient {
     }
 
     private static String xmlElement(String source, String name) {
-        String openingTag = "<" + name + ">";
-        String closingTag = "</" + name + ">";
-        int start = source.indexOf(openingTag);
-        int end = start < 0 ? -1 : source.indexOf(closingTag, start + openingTag.length());
-        if (start < 0 || end < 0) {
-            return "";
-        }
-        return source.substring(start + openingTag.length(), end).trim();
+        String qualifiedName = "(?:[A-Za-z_][A-Za-z0-9_.-]*:)?" + Pattern.quote(name);
+        Pattern element = Pattern.compile(
+                "<" + qualifiedName + "(?:\\s[^>]*)?>(.*?)</" + qualifiedName + "\\s*>",
+                Pattern.DOTALL);
+        Matcher match = element.matcher(source);
+        return match.find() ? match.group(1).trim() : "";
     }
 
     private static final class FaultDetails {

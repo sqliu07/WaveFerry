@@ -20,6 +20,7 @@ public final class PlaybackCapture {
     public static final int CHANNEL_COUNT = 2;
     public static final int BYTES_PER_SAMPLE = 2;
     public static final int FRAMES_PER_READ = 1_024;
+    private static final long CAPTURE_THREAD_JOIN_TIMEOUT_MS = 1_000L;
 
     public static final AudioStreamFormat DEFAULT_FORMAT =
             new AudioStreamFormat(SAMPLE_RATE_HZ, CHANNEL_COUNT, SampleFormat.PCM16_LE);
@@ -29,14 +30,15 @@ public final class PlaybackCapture {
     private final PcmSink pcmSink;
     private final Listener listener;
     private final AudioStreamFormat requestedFormat;
-    private final MediaProjection.Callback projectionCallback = new ProjectionStopCallback();
 
     private volatile boolean stopRequested;
     private volatile State state = State.IDLE;
+    private volatile long activeRunGeneration;
+    private long nextRunGeneration;
 
     private AudioRecord audioRecord;
+    private MediaProjection.Callback projectionCallback;
     private HandlerThread projectionCallbackThread;
-    private Handler projectionCallbackHandler;
     private Thread captureThread;
 
     public PlaybackCapture(MediaProjection mediaProjection, PcmSink pcmSink, Listener listener) {
@@ -79,20 +81,28 @@ public final class PlaybackCapture {
     }
 
     public boolean start() {
+        final long generation;
         synchronized (stateLock) {
-            if (state == State.STARTING || state == State.STARTED) {
+            if (state == State.STARTING || state == State.STARTED || state == State.STOPPING) {
                 return false;
             }
+            generation = ++nextRunGeneration;
+            activeRunGeneration = generation;
             stopRequested = false;
             state = State.STARTING;
         }
         notifyStateChanged(State.STARTING);
 
         AudioRecord createdRecord = null;
+        HandlerThread createdCallbackThread = null;
+        MediaProjection.Callback createdProjectionCallback = null;
         boolean callbackRegistered = false;
         try {
-            startProjectionCallbackThread();
-            mediaProjection.registerCallback(projectionCallback, projectionCallbackHandler);
+            createdCallbackThread = new HandlerThread("playback-projection-callback");
+            createdCallbackThread.start();
+            Handler createdCallbackHandler = Handler.createAsync(createdCallbackThread.getLooper());
+            createdProjectionCallback = new ProjectionStopCallback(generation);
+            mediaProjection.registerCallback(createdProjectionCallback, createdCallbackHandler);
             callbackRegistered = true;
             createdRecord = buildAudioRecord();
             createdRecord.startRecording();
@@ -100,41 +110,60 @@ public final class PlaybackCapture {
                 throw new IllegalStateException("AudioRecord failed to start recording");
             }
             synchronized (stateLock) {
-                if (state != State.STARTING || stopRequested) {
+                if (activeRunGeneration == generation
+                        && state == State.STARTING
+                        && !stopRequested) {
                     audioRecord = createdRecord;
                     createdRecord = null;
-                } else {
-                    audioRecord = createdRecord;
-                    createdRecord = null;
+                    projectionCallback = createdProjectionCallback;
+                    projectionCallbackThread = createdCallbackThread;
+                    createdCallbackThread = null;
+                    callbackRegistered = false;
                     state = State.STARTED;
-                    captureThread = new Thread(new CaptureLoop(audioRecord), "playback-capture");
+                    captureThread = new Thread(
+                            new CaptureLoop(audioRecord, generation), "playback-capture");
                     captureThread.start();
                 }
             }
-            if (getState() == State.STARTED) {
+            if (activeRunGeneration == generation && getState() == State.STARTED) {
                 notifyStateChanged(State.STARTED);
                 return true;
             }
-            finishStop(null, false, callbackRegistered);
-            callbackRegistered = false;
+            releaseCreatedResources(
+                    createdRecord,
+                    createdProjectionCallback,
+                    callbackRegistered,
+                    createdCallbackThread);
+            finishStop(null, false, false, generation);
             return false;
         } catch (Throwable error) {
-            if (createdRecord != null) {
-                createdRecord.release();
-            }
-            finishFailure(error, callbackRegistered);
+            releaseCreatedResources(
+                    createdRecord,
+                    createdProjectionCallback,
+                    callbackRegistered,
+                    createdCallbackThread);
+            finishFailure(error, true, generation);
             return false;
         }
     }
 
     public void stop() {
+        stopRun(activeRunGeneration);
+    }
+
+    private void stopRun(long expectedGeneration) {
         Thread threadToJoin = null;
         AudioRecord recordToStop = null;
         boolean shouldNotifyStopping = false;
+        long generation;
         synchronized (stateLock) {
-            if (state == State.IDLE || state == State.STOPPED) {
+            if (expectedGeneration == 0L
+                    || activeRunGeneration != expectedGeneration
+                    || state == State.IDLE
+                    || state == State.STOPPED) {
                 return;
             }
+            generation = activeRunGeneration;
             if (state != State.STOPPING) {
                 stopRequested = true;
                 state = State.STOPPING;
@@ -149,14 +178,7 @@ public final class PlaybackCapture {
         }
         requestAudioRecordStop(recordToStop);
         joinCaptureThread(threadToJoin);
-        finishStop(null, false, true);
-    }
-
-    private void startProjectionCallbackThread() {
-        HandlerThread handlerThread = new HandlerThread("playback-projection-callback");
-        handlerThread.start();
-        projectionCallbackThread = handlerThread;
-        projectionCallbackHandler = Handler.createAsync(handlerThread.getLooper());
+        finishStop(null, false, true, generation);
     }
 
     /** The caller verifies RECORD_AUDIO before creating the projection-backed recorder. */
@@ -212,7 +234,6 @@ public final class PlaybackCapture {
                 || sampleRate != requestedFormat.sampleRateHz()
                 || channelCount != requestedFormat.channelCount()
                 || frameSize != expectedFrameSize) {
-            record.release();
             throw new IllegalStateException(
                     "系统返回了不兼容的播放音频格式：encoding=" + encoding
                             + ", sampleRate=" + sampleRate
@@ -221,35 +242,39 @@ public final class PlaybackCapture {
         }
     }
 
-    private void finishFailure(Throwable error, boolean callbackRegistered) {
-        finishStop(error, true, callbackRegistered);
+    private void finishFailure(
+            Throwable error, boolean callbackRegistered, long expectedGeneration) {
+        finishStop(error, true, callbackRegistered, expectedGeneration);
     }
 
-    private void finishStop(Throwable error, boolean notifyError, boolean unregisterProjectionCallback) {
+    private void finishStop(
+            Throwable error,
+            boolean notifyError,
+            boolean unregisterProjectionCallback,
+            long expectedGeneration) {
         AudioRecord recordToRelease;
-        Thread captureThreadToClear;
+        MediaProjection.Callback callbackToUnregister;
         HandlerThread callbackThreadToQuit;
         boolean shouldNotifyStopped = false;
 
         synchronized (stateLock) {
+            if (activeRunGeneration != expectedGeneration) {
+                return;
+            }
             recordToRelease = audioRecord;
-            captureThreadToClear = captureThread;
+            callbackToUnregister = projectionCallback;
             callbackThreadToQuit = projectionCallbackThread;
 
             audioRecord = null;
             captureThread = null;
-            projectionCallbackHandler = null;
+            projectionCallback = null;
             projectionCallbackThread = null;
-            stopRequested = false;
+            activeRunGeneration = 0L;
 
             if (state != State.IDLE && state != State.STOPPED) {
                 state = State.STOPPED;
                 shouldNotifyStopped = true;
             }
-        }
-
-        if (captureThreadToClear != null && captureThreadToClear == Thread.currentThread()) {
-            captureThreadToClear = null;
         }
 
         if (recordToRelease != null) {
@@ -258,7 +283,9 @@ public final class PlaybackCapture {
         }
         if (unregisterProjectionCallback) {
             try {
-                mediaProjection.unregisterCallback(projectionCallback);
+                if (callbackToUnregister != null) {
+                    mediaProjection.unregisterCallback(callbackToUnregister);
+                }
             } catch (RuntimeException ignored) {
                 // MediaProjection can already be torn down when stop races with system shutdown.
             }
@@ -274,6 +301,27 @@ public final class PlaybackCapture {
         }
     }
 
+    private void releaseCreatedResources(
+            AudioRecord record,
+            MediaProjection.Callback callback,
+            boolean callbackRegistered,
+            HandlerThread callbackThread) {
+        if (record != null) {
+            requestAudioRecordStop(record);
+            record.release();
+        }
+        if (callbackRegistered && callback != null) {
+            try {
+                mediaProjection.unregisterCallback(callback);
+            } catch (RuntimeException ignored) {
+                // A concurrent projection stop can unregister the callback first.
+            }
+        }
+        if (callbackThread != null) {
+            callbackThread.quitSafely();
+        }
+    }
+
     private void notifyStateChanged(State newState) {
         if (listener != null) {
             listener.onStateChanged(newState);
@@ -284,6 +332,10 @@ public final class PlaybackCapture {
         if (listener != null && error != null) {
             listener.onError(error);
         }
+    }
+
+    private boolean shouldStopRun(long generation) {
+        return stopRequested || activeRunGeneration != generation;
     }
 
     private void requestAudioRecordStop(AudioRecord record) {
@@ -299,14 +351,32 @@ public final class PlaybackCapture {
         }
     }
 
-    private void joinCaptureThread(Thread thread) {
+    private boolean joinCaptureThread(Thread thread) {
         if (thread == null || thread == Thread.currentThread()) {
-            return;
+            return true;
+        }
+        boolean terminated = awaitThreadTermination(thread, CAPTURE_THREAD_JOIN_TIMEOUT_MS);
+        if (!terminated) {
+            // AudioRecord.release() in finishStop is the final unblock mechanism for a
+            // vendor implementation that ignores stop() while READ_BLOCKING is active.
+            thread.interrupt();
+        }
+        return terminated;
+    }
+
+    static boolean awaitThreadTermination(Thread thread, long timeoutMs) {
+        if (thread == null || thread == Thread.currentThread() || !thread.isAlive()) {
+            return true;
+        }
+        if (timeoutMs <= 0) {
+            throw new IllegalArgumentException("timeoutMs must be positive");
         }
         try {
-            thread.join();
+            thread.join(timeoutMs);
+            return !thread.isAlive();
         } catch (InterruptedException interruptedException) {
             Thread.currentThread().interrupt();
+            return false;
         }
     }
 
@@ -326,9 +396,11 @@ public final class PlaybackCapture {
 
     private final class CaptureLoop implements Runnable {
         private final AudioRecord record;
+        private final long generation;
 
-        private CaptureLoop(AudioRecord record) {
+        private CaptureLoop(AudioRecord record, long generation) {
             this.record = record;
+            this.generation = generation;
         }
 
         @Override
@@ -338,13 +410,16 @@ public final class PlaybackCapture {
             byte[] pcm16LeBuffer = new byte[CaptureBufferSizer.readBufferBytes(frameBytes, FRAMES_PER_READ)];
             long framePosition = 0L;
             try {
-                while (!stopRequested) {
+                while (!shouldStopRun(generation)) {
                     int samplesRead = record.read(
                             sampleBuffer,
                             0,
                             sampleBuffer.length,
                             AudioRecord.READ_BLOCKING);
                     if (samplesRead > 0) {
+                        if (shouldStopRun(generation)) {
+                            break;
+                        }
                         if (samplesRead % requestedFormat.channelCount() != 0) {
                             throw new IllegalStateException(
                                     "AudioRecord returned a partial PCM frame: " + samplesRead + " samples");
@@ -357,27 +432,37 @@ public final class PlaybackCapture {
                         framePosition += samplesRead / requestedFormat.channelCount();
                         continue;
                     }
-                    if (samplesRead == 0 && stopRequested) {
+                    if (samplesRead == 0 && shouldStopRun(generation)) {
                         break;
                     }
                     if (samplesRead == AudioRecord.ERROR_DEAD_OBJECT) {
                         throw new IllegalStateException("AudioRecord became unavailable");
                     }
-                    if (samplesRead < 0 && !stopRequested) {
+                    if (samplesRead < 0 && !shouldStopRun(generation)) {
                         throw new IllegalStateException("AudioRecord.read failed: " + samplesRead);
                     }
                 }
-                finishStop(null, false, true);
+                finishStop(null, false, true, generation);
             } catch (Throwable error) {
-                finishFailure(error, true);
+                if (shouldStopRun(generation)) {
+                    finishStop(null, false, true, generation);
+                } else {
+                    finishFailure(error, true, generation);
+                }
             }
         }
     }
 
     private final class ProjectionStopCallback extends MediaProjection.Callback {
+        private final long generation;
+
+        private ProjectionStopCallback(long generation) {
+            this.generation = generation;
+        }
+
         @Override
         public void onStop() {
-            stop();
+            stopRun(generation);
         }
     }
 }

@@ -95,6 +95,25 @@ public final class DlnaAvTransportClientTest {
         }
     }
 
+    @Test
+    public void readsPrefixedCurrentTransportState() throws Exception {
+        ServerSocket server = new ServerSocket();
+        server.bind(new InetSocketAddress("127.0.0.1", 0));
+        Thread serverThread = new Thread(
+                () -> servePrefixedTransportState(server), "dlna-prefixed-state-test");
+        serverThread.start();
+        try {
+            DlnaAvTransportClient client = new DlnaAvTransportClient(
+                    new URI("http://127.0.0.1:" + server.getLocalPort() + "/av"),
+                    "urn:schemas-upnp-org:service:AVTransport:1");
+
+            assertEquals("PLAYING", client.transportState());
+        } finally {
+            server.close();
+            serverThread.join(1_000L);
+        }
+    }
+
     private static void serve(ServerSocket server, List<String> actions) {
         try {
             for (int request = 0; request < 5; request++) {
@@ -136,6 +155,23 @@ public final class DlnaAvTransportClientTest {
         String body = "<s:Envelope><s:Body><u:GetTransportInfoResponse>"
                 + "<CurrentTransportState>PLAYING</CurrentTransportState>"
                 + "<CurrentTransportStatus>OK</CurrentTransportStatus>"
+                + "</u:GetTransportInfoResponse></s:Body></s:Envelope>";
+        try (Socket socket = server.accept()) {
+            String headers = readHeaders(socket.getInputStream());
+            socket.getInputStream().readNBytes(contentLength(headers));
+            OutputStream output = socket.getOutputStream();
+            output.write(("HTTP/1.1 200 OK\r\nContent-Length: "
+                    + body.getBytes(StandardCharsets.UTF_8).length + "\r\n\r\n" + body)
+                    .getBytes(StandardCharsets.UTF_8));
+            output.flush();
+        } catch (Exception ignored) {
+            // The assertion in the caller exposes an incomplete response.
+        }
+    }
+
+    private static void servePrefixedTransportState(ServerSocket server) {
+        String body = "<s:Envelope><s:Body><u:GetTransportInfoResponse>"
+                + "<u:CurrentTransportState>PLAYING</u:CurrentTransportState>"
                 + "</u:GetTransportInfoResponse></s:Body></s:Envelope>";
         try (Socket socket = server.accept()) {
             String headers = readHeaders(socket.getInputStream());

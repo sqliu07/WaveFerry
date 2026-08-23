@@ -91,7 +91,8 @@ public final class DlnaDeviceDescriptionParser {
                 continue;
             }
             Element service = (Element) node;
-            if (!text(service, "serviceType").startsWith(expectedServiceType)) {
+            if (!DlnaProtocol.isVersionedServiceType(
+                    text(service, "serviceType"), expectedServiceType)) {
                 continue;
             }
             String controlUrl = text(service, "controlURL");
@@ -112,7 +113,7 @@ public final class DlnaDeviceDescriptionParser {
             Node node = services.item(index);
             if (node instanceof Element) {
                 String type = text((Element) node, "serviceType");
-                if (type.startsWith(expectedServiceType)) {
+                if (DlnaProtocol.isVersionedServiceType(type, expectedServiceType)) {
                     return type;
                 }
             }

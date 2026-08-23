@@ -220,11 +220,7 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
             }
         });
         stopButton.setOnClickListener(view -> {
-            projectionRequestInFlight = false;
-            startService(StreamingService.createStopIntent(this));
-            applyStreamingStatus(
-                    StreamingService.STATUS_STOPPING,
-                    getString(R.string.status_stopping));
+            stopPreparedSession();
         });
         updateActionButtons();
     }
@@ -409,7 +405,14 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
         applyStreamingStatus(
                 StreamingService.STATUS_AWAITING_CAPTURE,
                 getString(R.string.projection_waiting));
-        startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_PROJECTION);
+        try {
+            startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_PROJECTION);
+        } catch (RuntimeException error) {
+            stopPreparedSession();
+            applyStreamingStatus(
+                    StreamingService.STATUS_ERROR,
+                    getString(R.string.projection_request_error, error.getMessage()));
+        }
     }
 
     @Override
@@ -444,7 +447,7 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
         }
         projectionRequestInFlight = false;
         if (resultCode != RESULT_OK || data == null) {
-            restoreStreamingStatus();
+            stopPreparedSession();
             return;
         }
         try {
@@ -458,9 +461,24 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
                     StreamingService.STATUS_CONNECTING,
                     getString(R.string.status_starting_capture));
         } catch (Exception error) {
+            stopPreparedSession();
             applyStreamingStatus(
                     StreamingService.STATUS_ERROR,
-                    getString(R.string.receiver_address_error, error.getMessage()));
+                    getString(R.string.projection_request_error, error.getMessage()));
+        }
+    }
+
+    private void stopPreparedSession() {
+        projectionRequestInFlight = false;
+        try {
+            startService(StreamingService.createStopIntent(this));
+            applyStreamingStatus(
+                    StreamingService.STATUS_STOPPING,
+                    getString(R.string.status_stopping));
+        } catch (RuntimeException error) {
+            applyStreamingStatus(
+                    StreamingService.STATUS_ERROR,
+                    getString(R.string.projection_request_error, error.getMessage()));
         }
     }
 
@@ -784,9 +802,14 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
         }
         IntentFilter filter = new IntentFilter(StreamingService.ACTION_STATUS);
         if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(
+                    statusReceiver,
+                    filter,
+                    StreamingService.STATUS_PERMISSION,
+                    null,
+                    Context.RECEIVER_NOT_EXPORTED);
         } else {
-            registerReceiver(statusReceiver, filter);
+            registerReceiver(statusReceiver, filter, StreamingService.STATUS_PERMISSION, null);
         }
         receiverRegistered = true;
     }

@@ -4,6 +4,11 @@
     android:height="48dp"
     android:viewportWidth="512"
     android:viewportHeight="512">
+    <!-- Blue background -->
+    <path
+        android:fillColor="#2563EB"
+        android:pathData="M0,0H512V512H0Z" />
+    <!-- Circle -->
     <path
         android:fillColor="#2563EB"
         android:pathData="M256,32A224,224 0,1 0,256 480A224,224 0,1 0,256 32" />

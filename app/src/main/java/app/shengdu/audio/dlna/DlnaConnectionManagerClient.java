@@ -22,19 +22,21 @@ final class DlnaConnectionManagerClient {
 
     DlnaSinkCapabilities getSinkCapabilities() throws IOException {
         HttpURLConnection connection = (HttpURLConnection) controlUri.toURL().openConnection();
-        connection.setInstanceFollowRedirects(false);
-        connection.setConnectTimeout(3_000);
-        connection.setReadTimeout(3_000);
-        connection.setRequestMethod("POST");
-        connection.setDoOutput(true);
-        connection.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
-        connection.setRequestProperty("SOAPACTION", "\"" + serviceType + "#GetProtocolInfo\"");
-        byte[] request = envelope().getBytes(StandardCharsets.UTF_8);
-        connection.setFixedLengthStreamingMode(request.length);
-        try (OutputStream output = connection.getOutputStream()) {
-            output.write(request);
-        }
         try {
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(3_000);
+            connection.setReadTimeout(3_000);
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            connection.setRequestProperty("User-Agent", DlnaProtocol.USER_AGENT);
+            connection.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
+            connection.setRequestProperty(
+                    "SOAPACTION", "\"" + serviceType + "#GetProtocolInfo\"");
+            byte[] request = envelope().getBytes(StandardCharsets.UTF_8);
+            connection.setFixedLengthStreamingMode(request.length);
+            try (OutputStream output = connection.getOutputStream()) {
+                output.write(request);
+            }
             if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
                 throw new IOException("DLNA GetProtocolInfo failed: HTTP " + connection.getResponseCode());
             }

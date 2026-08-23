@@ -8,6 +8,7 @@
     <string name="status_stopping">正在停止…</string>
     <string name="projection_waiting">请选择共享范围</string>
     <string name="projection_ready_hint">正在开始投送</string>
+    <string name="projection_request_error">无法启动系统音频共享：%1$s</string>
     <string name="status_connecting_receiver">正在连接 %1$s…</string>
     <string name="status_receiver_connected">连接成功 · 点击继续</string>
     <string name="status_starting_capture">正在启动音频投送…</string>

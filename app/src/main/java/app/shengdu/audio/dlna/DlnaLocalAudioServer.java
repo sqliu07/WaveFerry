@@ -14,11 +14,14 @@ import java.net.URI;
 import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -26,11 +29,20 @@ import java.util.concurrent.atomic.AtomicReference;
 /** Small per-session HTTP endpoint that exposes only a tokenized live PCM/WAV stream. */
 final class DlnaLocalAudioServer implements AutoCloseable {
     private static final int MAX_REQUEST_LINE_BYTES = 2_048;
+    private static final int MAX_HEADER_BYTES = 8 * 1024;
+    private static final int MAX_HEADER_COUNT = 32;
+    static final int HTTP_REQUEST_TIMEOUT_MS = 2_000;
     // PlaybackCapture emits 1,024-frame blocks (about 23 ms at 44.1 kHz). Keep only
     // a small jitter window; a larger queue turns brief TV/network stalls into lasting lag.
     private static final int MAX_QUEUED_BUFFERS = 3;
     private static final long BUFFER_WAIT_MS = 100L;
     private static final int SILENCE_DURATION_MS = 100;
+    private static final long ARTWORK_WAIT_MS = 350L;
+    private static final int MAX_CONCURRENT_ARTWORK_WAITS = 2;
+    // Keep one worker beyond the four parallel requests used by some renderers for
+    // probing artwork/ranges, so a slow auxiliary request cannot stall live audio.
+    static final int CONNECTION_WORKER_COUNT = 5;
+    static final int MAX_PENDING_CONNECTIONS = 8;
 
     private final InetAddress receiverAddress;
     private final AudioStreamFormat format;
@@ -38,11 +50,21 @@ final class DlnaLocalAudioServer implements AutoCloseable {
     private final BlockingQueue<byte[]> pcmBuffers = new ArrayBlockingQueue<>(MAX_QUEUED_BUFFERS);
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicReference<Socket> activeAudioSocket = new AtomicReference<>();
-    private final ExecutorService connections = Executors.newFixedThreadPool(4, runnable -> {
-        Thread thread = new Thread(runnable, "dlna-http-connection");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final Set<Socket> acceptedSockets = ConcurrentHashMap.newKeySet();
+    private final Object artworkLock = new Object();
+    private final Semaphore artworkWaitSlots = new Semaphore(MAX_CONCURRENT_ARTWORK_WAITS);
+    private final ExecutorService connections = new ThreadPoolExecutor(
+            CONNECTION_WORKER_COUNT,
+            CONNECTION_WORKER_COUNT,
+            0L,
+            TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(MAX_PENDING_CONNECTIONS),
+            runnable -> {
+                Thread thread = new Thread(runnable, "dlna-http-connection");
+                thread.setDaemon(true);
+                return thread;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
     private final String token;
 
     private ServerSocket serverSocket;
@@ -87,19 +109,24 @@ final class DlnaLocalAudioServer implements AutoCloseable {
                 + "/waveferry/" + pathToken + ".wav");
     }
 
-    URI artworkUri(int contentVersion) {
+    URI artworkUri(int trackVersion) {
         URI currentAudioUri = audioUri;
         if (currentAudioUri == null) {
             throw new IllegalStateException("DLNA audio server has not started");
         }
         return URI.create(currentAudioUri.toString().replace(token + ".wav", token + ".jpg")
-                + "?v=" + Integer.toUnsignedString(contentVersion, 16));
+                + "?v=" + Integer.toUnsignedString(trackVersion, 16));
     }
 
     void updateArtwork(byte[] jpeg) {
-        artworkJpeg = jpeg == null || jpeg.length == 0
-                ? null
-                : Arrays.copyOf(jpeg, jpeg.length);
+        synchronized (artworkLock) {
+            byte[] source = jpeg == null || jpeg.length == 0 ? null : jpeg;
+            if (Arrays.equals(artworkJpeg, source)) {
+                return;
+            }
+            artworkJpeg = source == null ? null : Arrays.copyOf(source, source.length);
+            artworkLock.notifyAll();
+        }
     }
 
     void discardBufferedPcm() {
@@ -126,8 +153,15 @@ final class DlnaLocalAudioServer implements AutoCloseable {
             return;
         }
         pcmBuffers.clear();
-        artworkJpeg = null;
+        synchronized (artworkLock) {
+            artworkJpeg = null;
+            artworkLock.notifyAll();
+        }
         closeQuietly(activeAudioSocket.getAndSet(null));
+        for (Socket socket : acceptedSockets) {
+            closeQuietly(socket);
+        }
+        acceptedSockets.clear();
         ServerSocket server = serverSocket;
         if (server != null) {
             try {
@@ -144,13 +178,29 @@ final class DlnaLocalAudioServer implements AutoCloseable {
             Socket socket = null;
             try {
                 socket = serverSocket.accept();
+                socket.setTcpNoDelay(true);
+                socket.setSoTimeout(HTTP_REQUEST_TIMEOUT_MS);
                 Socket accepted = socket;
-                connections.execute(() -> handle(accepted));
+                acceptedSockets.add(accepted);
+                connections.execute(() -> {
+                    try {
+                        handle(accepted);
+                    } finally {
+                        acceptedSockets.remove(accepted);
+                    }
+                });
             } catch (IOException ignored) {
+                if (socket != null) {
+                    acceptedSockets.remove(socket);
+                }
+                closeQuietly(socket);
                 if (!closed.get()) {
                     // A renderer may abandon a stream while seeking/retrying. Keep listening.
                 }
             } catch (RejectedExecutionException ignored) {
+                if (socket != null) {
+                    acceptedSockets.remove(socket);
+                }
                 closeQuietly(socket);
             }
         }
@@ -203,10 +253,17 @@ final class DlnaLocalAudioServer implements AutoCloseable {
         Resource resource = artworkPath.equals(pathWithoutQuery) ? Resource.ARTWORK : Resource.AUDIO;
         boolean hasRange = false;
         long rangeStart = 0;
+        int headerCount = 0;
+        int totalHeaderBytes = requestLine.length() + 2;
         while (true) {
             String line = readLine(input);
             if (line.isEmpty()) {
                 return new HttpRequest(parts[0], resource, hasRange, rangeStart);
+            }
+            headerCount++;
+            totalHeaderBytes += line.length() + 2;
+            if (headerCount > MAX_HEADER_COUNT || totalHeaderBytes > MAX_HEADER_BYTES) {
+                throw new IOException("DLNA HTTP request headers are too large");
             }
             int delimiter = line.indexOf(':');
             if (delimiter > 0 && "range".equalsIgnoreCase(line.substring(0, delimiter).trim())) {
@@ -233,9 +290,9 @@ final class DlnaLocalAudioServer implements AutoCloseable {
         while (!closed.get()) {
             try {
                 byte[] buffer = pcmBuffers.poll(BUFFER_WAIT_MS, TimeUnit.MILLISECONDS);
-                // LG validates the media stream while SetAVTransportURI is still pending.
-                // Feed real-time silence until Android capture starts so the control call
-                // and capture startup cannot deadlock waiting on each other.
+                // LG validates the media stream while SetAVTransportURI is pending. Feed
+                // real-time silence through brief capture underruns so the renderer keeps
+                // the live HTTP connection open without accumulating stale PCM.
                 output.write(buffer == null ? silenceBuffer : buffer);
                 output.flush();
             } catch (InterruptedException exception) {
@@ -246,7 +303,7 @@ final class DlnaLocalAudioServer implements AutoCloseable {
     }
 
     private void serveArtwork(OutputStream output, HttpRequest request) throws IOException {
-        byte[] jpeg = artworkJpeg;
+        byte[] jpeg = "HEAD".equals(request.method) ? artworkJpeg : awaitArtwork();
         if (jpeg == null || request.rangeStart >= jpeg.length) {
             if (request.hasRange) {
                 writeRangeNotSatisfiable(output, Resource.ARTWORK);
@@ -263,6 +320,36 @@ final class DlnaLocalAudioServer implements AutoCloseable {
         }
     }
 
+    private byte[] awaitArtwork() {
+        byte[] current = artworkJpeg;
+        if (current != null || closed.get()) {
+            return current;
+        }
+        if (!artworkWaitSlots.tryAcquire()) {
+            return null;
+        }
+        try {
+            long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ARTWORK_WAIT_MS);
+            synchronized (artworkLock) {
+                while (artworkJpeg == null && !closed.get()) {
+                    long remainingNanos = deadlineNanos - System.nanoTime();
+                    if (remainingNanos <= 0) {
+                        break;
+                    }
+                    try {
+                        TimeUnit.NANOSECONDS.timedWait(artworkLock, remainingNanos);
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                return artworkJpeg;
+            }
+        } finally {
+            artworkWaitSlots.release();
+        }
+    }
+
     private static void writeAudioHeaders(
             OutputStream output, boolean partialResponse, long rangeStart) throws IOException {
         long lastByte = DlnaWavStream.LIVE_CONTENT_LENGTH_BYTES - 1L;
@@ -272,6 +359,7 @@ final class DlnaLocalAudioServer implements AutoCloseable {
                 + "Content-Disposition: inline; filename=\"WaveFerry.wav\"\r\n"
                 + "Content-Length: " + responseLength + "\r\n"
                 + "Connection: close\r\n"
+                + "Cache-Control: no-cache, no-store, must-revalidate\r\n"
                 + "Accept-Ranges: bytes\r\n"
                 + (partialResponse ? "Content-Range: bytes " + rangeStart + "-" + lastByte + "/"
                         + DlnaWavStream.LIVE_CONTENT_LENGTH_BYTES + "\r\n" : "")
@@ -289,6 +377,7 @@ final class DlnaLocalAudioServer implements AutoCloseable {
                 + "Content-Type: image/jpeg\r\n"
                 + "Content-Length: " + responseLength + "\r\n"
                 + "Connection: close\r\n"
+                + "Cache-Control: no-cache, no-store, must-revalidate\r\n"
                 + "Accept-Ranges: bytes\r\n"
                 + (partialResponse ? "Content-Range: bytes " + rangeStart + "-" + (byteCount - 1) + "/"
                         + byteCount + "\r\n" : "")
@@ -302,14 +391,20 @@ final class DlnaLocalAudioServer implements AutoCloseable {
         long length = resource == Resource.AUDIO ? DlnaWavStream.LIVE_CONTENT_LENGTH_BYTES : 0;
         output.write(("HTTP/1.1 416 Range Not Satisfiable\r\n"
                 + "Content-Range: bytes */" + length
-                + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                + "\r\nContent-Length: 0\r\nConnection: close\r\n"
+                + (resource == Resource.ARTWORK
+                ? "Cache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\n"
+                : "")
+                + "\r\n")
                 .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
         output.flush();
     }
 
     private static void writeNotFound(OutputStream output) throws IOException {
         output.write(("HTTP/1.1 404 Not Found\r\n"
-                + "Content-Length: 0\r\nConnection: close\r\n\r\n")
+                + "Content-Length: 0\r\nConnection: close\r\n"
+                + "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                + "Pragma: no-cache\r\n\r\n")
                 .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
         output.flush();
     }
@@ -348,15 +443,11 @@ final class DlnaLocalAudioServer implements AutoCloseable {
     }
 
     private static InetAddress routeAddress(InetAddress receiver) throws IOException {
-        try (Socket routeProbe = new Socket()) {
-            routeProbe.connect(new InetSocketAddress(receiver, 9), 1_000);
+        // UDP route selection does not contact an arbitrary receiver port. The previous
+        // TCP port-9 probe could add a full second when a TV silently dropped the SYN.
+        try (java.net.DatagramSocket routeProbe = new java.net.DatagramSocket()) {
+            routeProbe.connect(receiver, 9);
             return routeProbe.getLocalAddress();
-        } catch (IOException ignored) {
-            // UDP avoids an actual service dependency while still asking the network stack for the route.
-            try (java.net.DatagramSocket routeProbe = new java.net.DatagramSocket()) {
-                routeProbe.connect(receiver, 9);
-                return routeProbe.getLocalAddress();
-            }
         }
     }
 

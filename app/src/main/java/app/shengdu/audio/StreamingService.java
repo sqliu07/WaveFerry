@@ -45,7 +45,9 @@ import java.net.URI;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -54,6 +56,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 /** Keeps system playback capture and the RAOP session alive while the app is backgrounded. */
 public final class StreamingService extends Service {
     public static final String ACTION_STATUS = "app.shengdu.audio.action.STATUS";
+    static final String STATUS_PERMISSION =
+            BuildConfig.APPLICATION_ID + ".permission.INTERNAL_STATUS";
     public static final String EXTRA_STATUS = "status";
     public static final String EXTRA_MESSAGE = "message";
     public static final String EXTRA_RECEIVER_KEY = "receiver_key";
@@ -99,6 +103,12 @@ public final class StreamingService extends Service {
     private final Object statusDispatchLock = new Object();
     private final Object muteLifecycleLock = new Object();
     private int sessionOwnerGeneration;
+    /** Latest metadata for a receiver that may still be preparing. Guarded by sessionLifecycleLock. */
+    private PendingMetadata latestPendingMetadata;
+    /** Latest metadata awaiting the single-threaded transport worker. Guarded by sessionLifecycleLock. */
+    private PendingMetadata pendingMetadataDispatch;
+    private boolean metadataDispatchQueued;
+    private int metadataDispatchGeneration;
 
     private volatile RaopStreamingClient raopClient;
     private volatile AsyncPcmSender raopPcmSender;
@@ -189,12 +199,15 @@ public final class StreamingService extends Service {
             return START_NOT_STICKY;
         }
         if (ACTION_ATTACH_CAPTURE.equals(intent.getAction())) {
-            startForeground(
-                    NOTIFICATION_ID,
+            int generation = sessionGeneration.get();
+            if (!startForegroundSafely(
+                    generation,
+                    startId,
                     buildNotification(getString(R.string.status_starting_capture)),
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                            | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
-            int generation = sessionGeneration.get();
+                            | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)) {
+                return START_NOT_STICKY;
+            }
             worker.execute(() -> attachPlaybackCapture(intent, generation));
             return START_NOT_STICKY;
         }
@@ -214,7 +227,9 @@ public final class StreamingService extends Service {
             activeReceiverKey = "";
         }
         activeReceiverDevice = receiverExtra(intent);
-        startInForeground(sessionReceiverName);
+        if (!startInForeground(sessionReceiverName, generation, startId)) {
+            return START_NOT_STICKY;
+        }
         worker.execute(() -> prepareSession(intent, generation, sessionReceiverName));
         return START_NOT_STICKY;
     }
@@ -230,6 +245,10 @@ public final class StreamingService extends Service {
             }
             stopping.set(false);
             sessionOwnerGeneration = generation;
+            latestPendingMetadata = null;
+            pendingMetadataDispatch = null;
+            metadataDispatchQueued = false;
+            metadataDispatchGeneration = generation;
             playbackFlowGate.reset();
         }
         try {
@@ -264,7 +283,7 @@ public final class StreamingService extends Service {
             if (dlnaTarget) {
                 DlnaStreamingClient client = createDlnaClient(
                         host, sessionReceiverName, txt, selectedFormat, generation);
-                client.start();
+                client.prepare();
                 if (!publishDlnaTransport(generation, client)) {
                     client.close();
                     cleanupStaleSession();
@@ -346,6 +365,10 @@ public final class StreamingService extends Service {
                 cleanupStaleSession();
                 return;
             }
+            DlnaStreamingClient dlna = dlnaClient;
+            if (dlna != null) {
+                dlna.startPlayback();
+            }
             if (!publishStreamingSessionState(generation)) {
                 cleanupStaleSession();
             }
@@ -383,6 +406,10 @@ public final class StreamingService extends Service {
                 return false;
             }
             dlnaClient = client;
+            PendingMetadata latest = latestPendingMetadata;
+            if (latest != null && latest.track != null && !latest.track.isEmpty()) {
+                latestPendingMetadata = latest.cacheFor(client);
+            }
             return true;
         }
     }
@@ -690,8 +717,69 @@ public final class StreamingService extends Service {
         // Scaling and JPEG compression run here, on the metadata thread — never
         // on the capture thread or the main thread.
         byte[] artworkJpeg = encodeArtwork(artwork);
-        PendingMetadata pending = new PendingMetadata(track, artworkJpeg, transition, revision);
-        worker.execute(() -> sendPendingMetadata(generation, pending));
+        PendingMetadata pending;
+        boolean queueDispatch = false;
+        synchronized (sessionLifecycleLock) {
+            if (!isCurrentGeneration(generation) || stopping.get()) {
+                return;
+            }
+            PendingMetadata next = new PendingMetadata(
+                    track,
+                    artworkJpeg,
+                    transition,
+                    revision,
+                    null,
+                    0L);
+            DlnaStreamingClient metadataDlna = dlnaClient;
+            if (metadataDlna != null && track != null && !track.isEmpty()) {
+                // Memory-only caching under the lifecycle lock closes the race between
+                // an initial metadata callback and publishing the prepared renderer.
+                next = next.cacheFor(metadataDlna);
+            }
+            pending = next;
+            latestPendingMetadata = pending;
+            pendingMetadataDispatch = pending;
+            if (!metadataDispatchQueued) {
+                metadataDispatchQueued = true;
+                metadataDispatchGeneration = generation;
+                queueDispatch = true;
+            }
+        }
+        if (queueDispatch) {
+            worker.execute(() -> dispatchLatestMetadata(generation));
+        }
+    }
+
+    private void dispatchLatestMetadata(int generation) {
+        PendingMetadata pending;
+        synchronized (sessionLifecycleLock) {
+            if (!isCurrentGeneration(generation)
+                    || metadataDispatchGeneration != generation
+                    || stopping.get()) {
+                if (metadataDispatchGeneration == generation) {
+                    pendingMetadataDispatch = null;
+                    metadataDispatchQueued = false;
+                }
+                return;
+            }
+            pending = pendingMetadataDispatch;
+            pendingMetadataDispatch = null;
+        }
+        sendPendingMetadata(generation, pending);
+
+        boolean dispatchAgain;
+        synchronized (sessionLifecycleLock) {
+            dispatchAgain = isCurrentGeneration(generation)
+                    && metadataDispatchGeneration == generation
+                    && !stopping.get()
+                    && pendingMetadataDispatch != null;
+            if (!dispatchAgain && metadataDispatchGeneration == generation) {
+                metadataDispatchQueued = false;
+            }
+        }
+        if (dispatchAgain) {
+            worker.execute(() -> dispatchLatestMetadata(generation));
+        }
     }
 
     private DacpSession startDacpSession(int generation, InetAddress host) {
@@ -781,17 +869,13 @@ public final class StreamingService extends Service {
         }
         DlnaStreamingClient dlna = dlnaClient;
         TrackMetadata track = pending.track;
-        if (dlna != null && track != null && !track.isEmpty()) {
+        if (dlna != null
+                && dlna == pending.cachedDlna
+                && pending.dlnaMetadataRevision > 0L
+                && track != null
+                && !track.isEmpty()) {
             try {
-                dlna.updateMetadata(
-                        track.getTitle(),
-                        track.getArtist(),
-                        track.getAlbum(),
-                        track.dedupKey(),
-                        track.getDurationMs(),
-                        track.getPositionMs(),
-                        pending.artworkJpeg,
-                        track.isPlaying());
+                dlna.applyCachedMetadata(pending.dlnaMetadataRevision);
             } catch (IOException | RuntimeException ignored) {
                 // Metadata is optional; an incompatible renderer must not stop live audio.
             }
@@ -863,16 +947,45 @@ public final class StreamingService extends Service {
         final byte[] artworkJpeg;
         final PlaybackFlowGate.Transition transition;
         final long revision;
+        final DlnaStreamingClient cachedDlna;
+        final long dlnaMetadataRevision;
 
         private PendingMetadata(
                 TrackMetadata track,
                 byte[] artworkJpeg,
                 PlaybackFlowGate.Transition transition,
-                long revision) {
+                long revision,
+                DlnaStreamingClient cachedDlna,
+                long dlnaMetadataRevision) {
             this.track = track;
             this.artworkJpeg = artworkJpeg;
             this.transition = transition;
             this.revision = revision;
+            this.cachedDlna = cachedDlna;
+            this.dlnaMetadataRevision = dlnaMetadataRevision;
+        }
+
+        private PendingMetadata cacheFor(DlnaStreamingClient client) {
+            TrackMetadata current = track;
+            if (client == null || current == null || current.isEmpty()) {
+                return this;
+            }
+            long cachedRevision = client.cacheMetadata(
+                    current.getTitle(),
+                    current.getArtist(),
+                    current.getAlbum(),
+                    current.dedupKey(),
+                    current.getDurationMs(),
+                    current.getPositionMs(),
+                    artworkJpeg,
+                    current.isPlaying());
+            return new PendingMetadata(
+                    current,
+                    artworkJpeg,
+                    transition,
+                    revision,
+                    client,
+                    cachedRevision);
         }
     }
 
@@ -971,6 +1084,10 @@ public final class StreamingService extends Service {
             activeFormat = null;
             activeReceiverName = "";
             activeMuteDevice = false;
+            latestPendingMetadata = null;
+            pendingMetadataDispatch = null;
+            metadataDispatchQueued = false;
+            metadataDispatchGeneration = 0;
             sender = raopPcmSender;
             raopPcmSender = null;
             client = raopClient;
@@ -1049,7 +1166,7 @@ public final class StreamingService extends Service {
         }
     }
 
-    private void startInForeground(String deviceName) {
+    private boolean startInForeground(String deviceName, int generation, int startId) {
         getSystemService(NotificationManager.class).cancel(ERROR_NOTIFICATION_ID);
         String message = getString(R.string.status_connecting_receiver, deviceName);
         // Publish the state before the session worker runs. If the user switches back
@@ -1058,10 +1175,46 @@ public final class StreamingService extends Service {
         lastStatus = new StatusSnapshot(
                 STATUS_CONNECTING, message, activeReceiverKey, activeReceiverDevice);
         Notification notification = buildNotification(message);
-        startForeground(
-                NOTIFICATION_ID,
+        return startForegroundSafely(
+                generation,
+                startId,
                 notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+    }
+
+    private boolean startForegroundSafely(
+            int generation,
+            int startId,
+            Notification notification,
+            int foregroundServiceType) {
+        try {
+            startForeground(NOTIFICATION_ID, notification, foregroundServiceType);
+            return true;
+        } catch (RuntimeException error) {
+            if (!sessionGeneration.compareAndSet(generation, generation + 1)) {
+                return false;
+            }
+            stopping.set(true);
+            int failedGeneration = generation + 1;
+            int ownerGeneration;
+            synchronized (sessionLifecycleLock) {
+                ownerGeneration = sessionOwnerGeneration;
+            }
+            broadcastTerminalStatusIfCurrent(
+                    failedGeneration, STATUS_ERROR, readableError(error));
+            worker.execute(() -> {
+                if (!isCurrentGeneration(failedGeneration)) {
+                    return;
+                }
+                if (ownerGeneration != 0) {
+                    stopSessionOwnedBy(ownerGeneration, false, false);
+                }
+                if (isCurrentGeneration(failedGeneration)) {
+                    stopSelfResult(startId);
+                }
+            });
+            return false;
+        }
     }
 
     private Notification buildNotification(String text) {
@@ -1210,7 +1363,7 @@ public final class StreamingService extends Service {
                 .putExtra(EXTRA_MESSAGE, message)
                 .putExtra(EXTRA_RECEIVER_KEY, activeReceiverKey)
                 .putExtra(EXTRA_RECEIVER_DEVICE, activeReceiverDevice);
-        sendBroadcast(update);
+        sendBroadcast(update, STATUS_PERMISSION);
     }
 
     private static String requiredStringExtra(Intent intent, String key) {
@@ -1258,10 +1411,15 @@ public final class StreamingService extends Service {
         return (ReceiverDevice) intent.getSerializableExtra(EXTRA_RECEIVER_DEVICE);
     }
 
-    private static String readableError(Throwable error) {
+    static String readableError(Throwable error) {
         Throwable current = error;
-        while (current.getCause() != null && current.getCause() != current) {
-            current = current.getCause();
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        while (current != null && seen.add(current)) {
+            Throwable cause = current.getCause();
+            if (cause == null || seen.contains(cause)) {
+                break;
+            }
+            current = cause;
         }
         String message = current.getMessage();
         return message == null || message.isBlank()

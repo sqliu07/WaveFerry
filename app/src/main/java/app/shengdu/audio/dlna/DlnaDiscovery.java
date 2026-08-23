@@ -198,7 +198,7 @@ public final class DlnaDiscovery implements AutoCloseable {
             connection.setInstanceFollowRedirects(false);
             connection.setConnectTimeout(3_000);
             connection.setReadTimeout(3_000);
-            connection.setRequestProperty("User-Agent", "WaveFerry/0.2.0 UPnP/1.0");
+            connection.setRequestProperty("User-Agent", DlnaProtocol.USER_AGENT);
             try {
                 int responseCode = connection.getResponseCode();
                 if (responseCode != HttpURLConnection.HTTP_OK) {
@@ -257,7 +257,7 @@ public final class DlnaDiscovery implements AutoCloseable {
                 + "MAN: \"ssdp:discover\"\r\n"
                 + "MX: 2\r\n"
                 + "ST: " + target + "\r\n"
-                + "USER-AGENT: WaveFerry/0.2.0 UPnP/1.0\r\n\r\n";
+                + "USER-AGENT: " + DlnaProtocol.USER_AGENT + "\r\n\r\n";
         return request.getBytes(StandardCharsets.US_ASCII);
     }
 
