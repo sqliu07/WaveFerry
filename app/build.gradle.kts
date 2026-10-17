@@ -33,6 +33,10 @@ val hasPartialReleaseSigning = listOf(
     releaseKeyPassword
 ).any { it != null } && !hasReleaseSigning
 
+val externalUpdatesEnabled = providers.gradleProperty("waveferry.externalUpdates")
+    .map { it.toBooleanStrict() }
+    .getOrElse(true)
+
 if (hasPartialReleaseSigning) {
     throw GradleException("Release signing is incomplete; provide all four WaveFerry signing values")
 }
@@ -45,8 +49,10 @@ android {
         applicationId = "app.shengdu.audio"
         minSdk = 31
         targetSdk = 36
-        versionCode = 14
-        versionName = "0.2.3"
+        versionCode = 15
+        versionName = "0.2.4"
+
+        buildConfigField("boolean", "EXTERNAL_UPDATES_ENABLED", externalUpdatesEnabled.toString())
 
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }
@@ -76,6 +82,13 @@ android {
             if (hasReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
+        }
+    }
+
+    sourceSets {
+        if (externalUpdatesEnabled) {
+            getByName("debug").manifest.srcFile("src/externalUpdates/AndroidManifest.xml")
+            getByName("release").manifest.srcFile("src/externalUpdates/AndroidManifest.xml")
         }
     }
 

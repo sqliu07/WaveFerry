@@ -105,7 +105,7 @@ final class ReceiverDiscoverySupport {
                 return value;
             }
         }
-        return "AirPlay 设备";
+        return "AirPlay device";
     }
 
     static String selectPreferredAddress(InetAddress host, List<InetAddress> hostAddresses) {

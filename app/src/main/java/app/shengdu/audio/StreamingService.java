@@ -220,7 +220,7 @@ public final class StreamingService extends Service {
 
         String requestedReceiverName = intent.getStringExtra(EXTRA_RECEIVER_NAME);
         if (requestedReceiverName == null || requestedReceiverName.isBlank()) {
-            requestedReceiverName = "AirPlay 设备";
+            requestedReceiverName = getString(R.string.receiver_default_airplay_name);
         }
         int generation = sessionGeneration.incrementAndGet();
         String sessionReceiverName = requestedReceiverName;
@@ -268,7 +268,7 @@ public final class StreamingService extends Service {
             InetAddress host = InetAddress.getByName(requiredStringExtra(intent, EXTRA_HOST));
             int port = intent.getIntExtra(EXTRA_PORT, -1);
             if (port <= 0 || port > 65_535) {
-                throw new IllegalArgumentException("接收器端口无效");
+                throw new IllegalArgumentException(getString(R.string.receiver_port_invalid));
             }
 
             Map<String, byte[]> txt = readTxtAttributes(intent);
@@ -333,7 +333,7 @@ public final class StreamingService extends Service {
             if (sessionGeneration.compareAndSet(generation, generation + 1)) {
                 stopping.set(true);
                 broadcastTerminalStatusIfCurrent(
-                        generation + 1, STATUS_ERROR, readableError(error));
+                        generation + 1, STATUS_ERROR, localizedError(error));
                 stopSessionOwnedBy(generation, true, false);
             } else {
                 cleanupStaleSession();
@@ -378,7 +378,7 @@ public final class StreamingService extends Service {
             if (sessionGeneration.compareAndSet(generation, generation + 1)) {
                 stopping.set(true);
                 broadcastTerminalStatusIfCurrent(
-                        generation + 1, STATUS_ERROR, readableError(error));
+                        generation + 1, STATUS_ERROR, localizedError(error));
                 stopSessionOwnedBy(generation, true, false);
             } else {
                 cleanupStaleSession();
@@ -493,7 +493,7 @@ public final class StreamingService extends Service {
                 (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         MediaProjection projection = manager.getMediaProjection(resultCode, projectionData);
         if (projection == null) {
-            throw new IllegalStateException("未获得系统音频捕获授权");
+            throw new IllegalStateException(getString(R.string.capture_permission_missing));
         }
 
         PlaybackCapture capture = new PlaybackCapture(
@@ -504,7 +504,7 @@ public final class StreamingService extends Service {
         if (!capture.start()) {
             capture.stop();
             projection.stop();
-            throw new IllegalStateException("无法启动系统播放音频捕获");
+            throw new IllegalStateException(getString(R.string.capture_start_failed));
         }
         synchronized (sessionLifecycleLock) {
             if (isCurrentGeneration(generation) && !stopping.get()) {
@@ -598,10 +598,10 @@ public final class StreamingService extends Service {
                         () -> dispatchDlnaPlaybackRequest(generation, playing)));
     }
 
-    private static String requiredDlnaAttribute(Map<String, byte[]> attributes, String key) {
+    private String requiredDlnaAttribute(Map<String, byte[]> attributes, String key) {
         byte[] value = attributes.get(key);
         if (value == null || value.length == 0) {
-            throw new IllegalArgumentException("DLNA 接收器缺少 " + key);
+            throw new IllegalArgumentException(getString(R.string.dlna_attribute_missing, key));
         }
         return new String(value, java.nio.charset.StandardCharsets.UTF_8);
     }
@@ -641,7 +641,7 @@ public final class StreamingService extends Service {
         if (sessionGeneration.compareAndSet(generation, generation + 1)
                 && stopping.compareAndSet(false, true)) {
             broadcastTerminalStatusIfCurrent(
-                    generation + 1, STATUS_ERROR, readableError(error));
+                    generation + 1, STATUS_ERROR, localizedError(error));
             worker.execute(() -> stopSessionOwnedBy(generation, true, false));
         }
     }
@@ -1162,7 +1162,7 @@ public final class StreamingService extends Service {
 
         if (stopServiceAfterCleanup) {
             if (announceStopped) {
-                broadcastStatus(STATUS_STOPPED, "投送已停止");
+                broadcastStatus(STATUS_STOPPED, getString(R.string.status_stopped));
             }
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
@@ -1204,7 +1204,7 @@ public final class StreamingService extends Service {
                 ownerGeneration = sessionOwnerGeneration;
             }
             broadcastTerminalStatusIfCurrent(
-                    failedGeneration, STATUS_ERROR, readableError(error));
+                    failedGeneration, STATUS_ERROR, localizedError(error));
             worker.execute(() -> {
                 if (!isCurrentGeneration(failedGeneration)) {
                     return;
@@ -1272,7 +1272,7 @@ public final class StreamingService extends Service {
                 NOTIFICATION_CHANNEL_ID,
                 getString(R.string.notification_channel_name),
                 NotificationManager.IMPORTANCE_LOW);
-        channel.setDescription("显示正在进行的系统音频投送会话");
+        channel.setDescription(getString(R.string.notification_channel_description));
         getSystemService(NotificationManager.class).createNotificationChannel(channel);
     }
 
@@ -1369,16 +1369,16 @@ public final class StreamingService extends Service {
         sendBroadcast(update, STATUS_PERMISSION);
     }
 
-    private static String requiredStringExtra(Intent intent, String key) {
+    private String requiredStringExtra(Intent intent, String key) {
         String value = intent.getStringExtra(key);
         if (value == null || value.isBlank()) {
-            throw new IllegalArgumentException("缺少连接信息: " + key);
+            throw new IllegalArgumentException(getString(R.string.connection_info_missing, key));
         }
         return value;
     }
 
     @SuppressWarnings("deprecation")
-    private static Intent getProjectionData(Intent intent) {
+    private Intent getProjectionData(Intent intent) {
         Intent data;
         if (android.os.Build.VERSION.SDK_INT >= 33) {
             data = intent.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent.class);
@@ -1386,7 +1386,7 @@ public final class StreamingService extends Service {
             data = intent.getParcelableExtra(EXTRA_PROJECTION_DATA);
         }
         if (data == null) {
-            throw new IllegalArgumentException("缺少系统音频捕获授权");
+            throw new IllegalArgumentException(getString(R.string.capture_permission_missing));
         }
         return data;
     }
@@ -1415,6 +1415,14 @@ public final class StreamingService extends Service {
     }
 
     static String readableError(Throwable error) {
+        return "Streaming failed: " + errorDetail(error);
+    }
+
+    private String localizedError(Throwable error) {
+        return getString(R.string.streaming_failed, errorDetail(error));
+    }
+
+    private static String errorDetail(Throwable error) {
         Throwable current = error;
         Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         while (current != null && seen.add(current)) {
@@ -1426,8 +1434,8 @@ public final class StreamingService extends Service {
         }
         String message = current.getMessage();
         return message == null || message.isBlank()
-                ? "投送失败：" + current.getClass().getSimpleName()
-                : "投送失败：" + message;
+                ? current.getClass().getSimpleName()
+                : message;
     }
 
     @Override
@@ -1447,7 +1455,8 @@ public final class StreamingService extends Service {
                 || STATUS_STREAMING.equals(status.status)) {
             activeReceiverKey = "";
             activeReceiverDevice = null;
-            lastStatus = new StatusSnapshot(STATUS_STOPPED, "投送服务已结束", "", null);
+            lastStatus = new StatusSnapshot(
+                    STATUS_STOPPED, getString(R.string.status_service_ended), "", null);
         }
         super.onDestroy();
     }
@@ -1473,7 +1482,7 @@ public final class StreamingService extends Service {
             if (sessionGeneration.compareAndSet(generation, generation + 1)
                     && stopping.compareAndSet(false, true)) {
                 broadcastTerminalStatusIfCurrent(
-                        generation + 1, STATUS_ERROR, readableError(error));
+                        generation + 1, STATUS_ERROR, localizedError(error));
                 worker.execute(() -> stopSessionOwnedBy(generation, true, false));
             }
         }

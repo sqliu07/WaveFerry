@@ -1,0 +1,13 @@
+<resources>
+    <string name="receiver_default_airplay_name">AirPlay 设备</string>
+    <string name="receiver_port_invalid">接收器端口无效</string>
+    <string name="capture_permission_missing">缺少系统音频捕获授权</string>
+    <string name="capture_start_failed">无法启动系统播放音频捕获</string>
+    <string name="dlna_attribute_missing">DLNA 接收器缺少 %1$s</string>
+    <string name="status_stopped">投送已停止</string>
+    <string name="notification_channel_description">显示正在进行的系统音频投送会话</string>
+    <string name="connection_info_missing">缺少连接信息：%1$s</string>
+    <string name="streaming_failed">投送失败：%1$s</string>
+    <string name="status_service_ended">投送服务已结束</string>
+    <string name="dlna_discovery_error">DLNA 扫描失败：%1$s</string>
+</resources>

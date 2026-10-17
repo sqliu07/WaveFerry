@@ -1,0 +1,13 @@
+<resources>
+    <string name="receiver_default_airplay_name">AirPlay device</string>
+    <string name="receiver_port_invalid">Invalid receiver port</string>
+    <string name="capture_permission_missing">System audio capture permission is missing</string>
+    <string name="capture_start_failed">Could not start system playback audio capture</string>
+    <string name="dlna_attribute_missing">DLNA receiver is missing %1$s</string>
+    <string name="status_stopped">Streaming stopped</string>
+    <string name="notification_channel_description">Shows the current device audio streaming session</string>
+    <string name="connection_info_missing">Connection information is missing: %1$s</string>
+    <string name="streaming_failed">Streaming failed: %1$s</string>
+    <string name="status_service_ended">Streaming service ended</string>
+    <string name="dlna_discovery_error">DLNA scan failed: %1$s</string>
+</resources>

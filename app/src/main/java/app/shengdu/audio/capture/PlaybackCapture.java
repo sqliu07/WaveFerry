@@ -235,7 +235,7 @@ public final class PlaybackCapture {
                 || channelCount != requestedFormat.channelCount()
                 || frameSize != expectedFrameSize) {
             throw new IllegalStateException(
-                    "系统返回了不兼容的播放音频格式：encoding=" + encoding
+                    "System returned an incompatible playback audio format: encoding=" + encoding
                             + ", sampleRate=" + sampleRate
                             + ", channels=" + channelCount
                             + ", frameBytes=" + frameSize);

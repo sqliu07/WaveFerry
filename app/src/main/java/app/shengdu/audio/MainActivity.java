@@ -376,7 +376,7 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
                     this,
                     address,
                     receiver.getPort(),
-                    receiver.getDisplayName(),
+                    receiverDisplayName(receiver),
                     receiver.getStableKey(),
                     receiver,
                     encodeTxtAttributes(receiver.getTxtAttributes()),
@@ -387,7 +387,7 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
             activeReceiverDevice = receiver;
             applyStreamingStatus(
                     StreamingService.STATUS_CONNECTING,
-                    getString(R.string.status_connecting_receiver, receiver.getDisplayName()));
+                    getString(R.string.status_connecting_receiver, receiverDisplayName(receiver)));
         } catch (Exception error) {
             applyStreamingStatus(
                     StreamingService.STATUS_ERROR,
@@ -836,6 +836,13 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
         return selectedReceiver == null ? "" : selectedReceiver.getStableKey();
     }
 
+    private String receiverDisplayName(ReceiverDevice receiver) {
+        String name = receiver.getDisplayName();
+        return "AirPlay device".equals(name)
+                ? getString(R.string.receiver_default_airplay_name)
+                : name;
+    }
+
     private void renderReceiverList(String selectedKey) {
         ReceiverDevice restoredSelection = null;
         for (ReceiverDevice device : devices) {
@@ -851,7 +858,7 @@ public final class MainActivity extends Activity implements AirPlayDiscovery.Lis
             View row = inflater.inflate(R.layout.item_receiver, receiverList, false);
             boolean selected = device == selectedReceiver;
             row.setActivated(selected);
-            ((TextView) row.findViewById(R.id.text_receiver_name)).setText(device.getDisplayName());
+            ((TextView) row.findViewById(R.id.text_receiver_name)).setText(receiverDisplayName(device));
             ((TextView) row.findViewById(R.id.text_receiver_type)).setText(
                     device.supportsDlna() ? R.string.receiver_type_dlna : R.string.receiver_type_airplay);
             ((ImageView) row.findViewById(R.id.image_receiver_type)).setImageResource(

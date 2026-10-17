@@ -161,6 +161,16 @@ public final class ReleaseUpdateChecker implements AutoCloseable {
             return releaseUrl;
         }
 
+        public String getApkFileName() {
+            return "WaveFerry-" + versionName + "-release.apk";
+        }
+
+        public String getApkDownloadUrl() {
+            String tag = releaseUrl.substring(releaseUrl.lastIndexOf('/') + 1);
+            return "https://github.com/sqliu07/WaveFerry/releases/download/" + tag
+                    + "/" + getApkFileName();
+        }
+
         public boolean isUpdateAvailable() {
             return updateAvailable;
         }

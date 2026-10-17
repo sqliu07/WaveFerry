@@ -467,7 +467,7 @@ public final class DlnaStreamingClient implements AutoCloseable {
         } while (System.nanoTime() < deadlineNanos);
         String finalState = readTransportState();
         throw new IOException(lastTransitionError.getMessage()
-                + "，电视状态：" + (finalState.isEmpty() ? "未知" : finalState),
+                + ", receiver state: " + (finalState.isEmpty() ? "unknown" : finalState),
                 lastTransitionError);
     }
 
@@ -512,7 +512,7 @@ public final class DlnaStreamingClient implements AutoCloseable {
         String finalState = readTransportState();
         if (!isPlaying(finalState)) {
             throw new IOException(lastTransitionError.getMessage()
-                    + "，电视状态：" + (finalState.isEmpty() ? "未知" : finalState),
+                    + ", receiver state: " + (finalState.isEmpty() ? "unknown" : finalState),
                     lastTransitionError);
         }
     }

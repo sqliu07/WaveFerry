@@ -30,6 +30,9 @@ public final class ReleaseUpdateCheckerTest {
             assertTrue(result.isUpdateAvailable());
             assertEquals("0.2.3", result.getVersionName());
             assertEquals(TRUSTED_URL, result.getReleaseUrl());
+            assertEquals("WaveFerry-0.2.3-release.apk", result.getApkFileName());
+            assertEquals("https://github.com/sqliu07/WaveFerry/releases/download/v0.2.3/"
+                    + "WaveFerry-0.2.3-release.apk", result.getApkDownloadUrl());
             assertEquals("HEAD", connection.getRequestMethod());
             assertFalse(connection.getInstanceFollowRedirects());
             assertEquals("WaveFerry-UpdateChecker", connection.getRequestProperty("User-Agent"));
@@ -48,6 +51,16 @@ public final class ReleaseUpdateCheckerTest {
     @Test
     public void comparesTheRedirectVersionNumerically() throws Exception {
         assertTrue(check("0.2.2", TRUSTED_URL.replace("v0.2.3", "v0.2.10")).isUpdateAvailable());
+    }
+
+    @Test
+    public void downloadUsesTheOriginalTagAndTheNormalizedAssetVersion() throws Exception {
+        for (String tag : new String[]{"0.2.10", "v0.2.10", "V0.2.10"}) {
+            ReleaseUpdateChecker.Result result = check("0.2.2", TRUSTED_URL.replace("v0.2.3", tag));
+            assertEquals("WaveFerry-0.2.10-release.apk", result.getApkFileName());
+            assertEquals("https://github.com/sqliu07/WaveFerry/releases/download/" + tag
+                    + "/WaveFerry-0.2.10-release.apk", result.getApkDownloadUrl());
+        }
     }
 
     @Test

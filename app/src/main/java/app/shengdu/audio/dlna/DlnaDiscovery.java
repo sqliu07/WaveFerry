@@ -5,6 +5,8 @@ import android.net.wifi.WifiManager;
 import android.os.Handler;
 import android.os.Looper;
 
+import app.shengdu.audio.R;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -45,6 +47,7 @@ public final class DlnaDiscovery implements AutoCloseable {
     private static final int SCAN_TIMEOUT_MS = 4_000;
 
     private final Listener listener;
+    private final Context context;
     private final WifiManager wifiManager;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
@@ -59,8 +62,8 @@ public final class DlnaDiscovery implements AutoCloseable {
 
     public DlnaDiscovery(Context context, Listener listener) {
         this.listener = Objects.requireNonNull(listener, "listener");
-        Object service = Objects.requireNonNull(context, "context")
-                .getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        this.context = Objects.requireNonNull(context, "context").getApplicationContext();
+        Object service = this.context.getSystemService(Context.WIFI_SERVICE);
         if (!(service instanceof WifiManager)) {
             throw new IllegalStateException("Wi-Fi service is unavailable");
         }
@@ -130,7 +133,7 @@ public final class DlnaDiscovery implements AutoCloseable {
             }
         } catch (IOException error) {
             if (isCurrentScan(generation)) {
-                deliverError("DLNA 扫描失败：" + readableMessage(error));
+                deliverError(context.getString(R.string.dlna_discovery_error, readableMessage(error)));
             }
         } finally {
             activeSocket = null;

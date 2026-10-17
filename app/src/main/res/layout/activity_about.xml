@@ -72,6 +72,56 @@
             android:text="@string/about_check_updates"
             style="@style/Shengdu.Button.Primary" />
 
+        <LinearLayout
+            android:id="@+id/about_download_panel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_m"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/text_update_download"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:accessibilityLiveRegion="polite"
+                android:textColor="@color/shengdu_text_secondary"
+                android:textSize="14sp" />
+
+            <ProgressBar
+                android:id="@+id/progress_update_download"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/space_s"
+                android:contentDescription="@string/about_download_progress"
+                android:max="100" />
+
+            <Button
+                android:id="@+id/button_install_update"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/space_m"
+                android:text="@string/about_install_update"
+                style="@style/Shengdu.Button.Primary" />
+
+            <Button
+                android:id="@+id/button_cancel_update"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/space_m"
+                android:text="@string/about_cancel_download"
+                style="@style/Shengdu.Button.Secondary" />
+
+            <Button
+                android:id="@+id/button_download_browser"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/space_m"
+                android:text="@string/about_open_release"
+                style="@style/Shengdu.Button.Secondary" />
+        </LinearLayout>
+
         <Button
             android:id="@+id/button_about_project"
             android:layout_width="match_parent"

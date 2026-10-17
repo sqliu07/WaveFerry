@@ -14,7 +14,7 @@ public final class StreamingServiceErrorTest {
 
         String message = StreamingService.readableError(first);
 
-        assertTrue(message.equals("投送失败：first") || message.equals("投送失败：second"));
+        assertTrue(message.equals("Streaming failed: first") || message.equals("Streaming failed: second"));
     }
 
     private static final class CyclicThrowable extends RuntimeException {
