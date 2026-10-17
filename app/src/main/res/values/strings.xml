@@ -65,7 +65,10 @@
     <string name="about_check_updates">检查更新</string>
     <string name="about_checking_updates">正在检查更新…</string>
     <string name="about_no_updates">已是最新版本</string>
-    <string name="about_update_failed">暂时无法检查更新，请稍后重试</string>
+    <string name="about_update_failed_title">检查更新失败</string>
+    <string name="about_update_failed">暂时无法读取最新版本信息，可以前往发布页查看</string>
+    <string name="about_update_access_limited">更新服务暂时限制访问，请稍后重试，或前往发布页查看</string>
+    <string name="about_update_timeout">检查更新超时，请检查网络后重试，或前往发布页查看</string>
     <string name="about_update_title">发现新版本</string>
     <string name="about_update_message">%1$s 已发布，前往发布页查看更新内容和下载。</string>
     <string name="about_open_release">前往发布页</string>
@@ -75,6 +78,7 @@
     <string name="about_privacy">隐私说明</string>
     <string name="about_open_link_failed">无法打开链接，请确认已安装浏览器</string>
     <string name="project_url" translatable="false">https://github.com/sqliu07/WaveFerry</string>
+    <string name="latest_release_url" translatable="false">https://github.com/sqliu07/WaveFerry/releases/latest</string>
     <string name="privacy_url" translatable="false">https://github.com/sqliu07/WaveFerry/blob/main/PRIVACY.md</string>
     <string name="support_url" translatable="false"></string>
 

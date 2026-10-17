@@ -5,7 +5,6 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
@@ -24,47 +23,118 @@ public final class ReleaseUpdateCheckerTest {
     private static final String TRUSTED_URL = "https://github.com/sqliu07/WaveFerry/releases/tag/v0.2.3";
 
     @Test
-    public void reportsNewStableVersionAndTrustedReleasePage() throws Exception {
-        ReleaseUpdateChecker.Result result = result("0.2.2", "v0.2.3", TRUSTED_URL, false, false);
-
-        assertTrue(result.isUpdateAvailable());
-        assertEquals("0.2.3", result.getVersionName());
-        assertEquals(TRUSTED_URL, result.getReleaseUrl());
+    public void checksWithHeadAndReturnsTheTrustedReleaseWithoutReadingItsBody() throws Exception {
+        FakeConnection connection = new FakeConnection();
+        try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection)) {
+            ReleaseUpdateChecker.Result result = checker.check("0.2.2");
+            assertTrue(result.isUpdateAvailable());
+            assertEquals("0.2.3", result.getVersionName());
+            assertEquals(TRUSTED_URL, result.getReleaseUrl());
+            assertEquals("HEAD", connection.getRequestMethod());
+            assertFalse(connection.getInstanceFollowRedirects());
+            assertEquals("WaveFerry-UpdateChecker", connection.getRequestProperty("User-Agent"));
+            assertEquals(7_000, connection.getConnectTimeout());
+            assertEquals(7_000, connection.getReadTimeout());
+            assertEquals(1, connection.disconnectCount.get());
+        }
     }
 
     @Test
-    public void doesNotOfferTheCurrentOrOlderReleaseAsAnUpdate() throws Exception {
-        assertFalse(result("0.2.3", "v0.2.3", TRUSTED_URL, false, false).isUpdateAvailable());
-        assertFalse(result("0.2.10", "v0.2.3", TRUSTED_URL, false, false).isUpdateAvailable());
+    public void doesNotOfferCurrentOrOlderReleases() throws Exception {
+        assertFalse(check("0.2.3", TRUSTED_URL).isUpdateAvailable());
+        assertFalse(check("0.2.10", TRUSTED_URL).isUpdateAvailable());
     }
 
     @Test
-    public void refusesDraftAndPrereleaseResponses() throws Exception {
-        expectRejected(() -> result("0.2.2", "v0.2.3", TRUSTED_URL, true, false));
-        expectRejected(() -> result("0.2.2", "v0.2.3", TRUSTED_URL, false, true));
+    public void comparesTheRedirectVersionNumerically() throws Exception {
+        assertTrue(check("0.2.2", TRUSTED_URL.replace("v0.2.3", "v0.2.10")).isUpdateAvailable());
     }
 
     @Test
-    public void refusesMissingOrInvalidVersions() throws Exception {
-        expectRejected(() -> result("0.2.2", null, TRUSTED_URL, false, false));
-        expectRejected(() -> result("0.2.2", "v0.2.3-rc.1", TRUSTED_URL, false, false));
-        expectRejected(() -> result("unknown", "v0.2.3", TRUSTED_URL, false, false));
+    public void resolvesTrustedRelativeRedirects() throws Exception {
+        String[] locations = {"/sqliu07/WaveFerry/releases/tag/v0.2.3", "tag/v0.2.3",
+                "//github.com/sqliu07/WaveFerry/releases/tag/v0.2.3"};
+        for (String location : locations) {
+            assertEquals(TRUSTED_URL, check("0.2.2", location).getReleaseUrl());
+        }
     }
 
     @Test
-    public void refusesUrlsOutsideTheExactRepositoryRelease() throws Exception {
-        String[] invalid = {null, "", "http://github.com/sqliu07/WaveFerry/releases/tag/v0.2.3",
+    public void acceptsOnlyDirectReleaseRedirectStatuses() throws Exception {
+        for (int status : new int[]{301, 302, 303, 307, 308}) {
+            FakeConnection connection = new FakeConnection();
+            connection.status = status;
+            try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection)) {
+                assertTrue(checker.check("0.2.2").isUpdateAvailable());
+            }
+        }
+    }
+
+    @Test
+    public void rejectsMissingInvalidAndPrereleaseTags() throws Exception {
+        String[] invalid = {null, "", TRUSTED_URL.replace("v0.2.3", "v0.2.3-rc.1"),
+                TRUSTED_URL.replace("v0.2.3", "v0.2.3+build"),
+                TRUSTED_URL.replace("v0.2.3", "%760.2.3"),
+                TRUSTED_URL.replace("v0.2.3", ""), TRUSTED_URL + "/other", "not a uri"};
+        for (String location : invalid) {
+            expectRejected(() -> check("0.2.2", location));
+        }
+    }
+
+    @Test
+    public void rejectsUntrustedRedirectsAndAdditionalRedirectHops() throws Exception {
+        String[] invalid = {"http://github.com/sqliu07/WaveFerry/releases/tag/v0.2.3",
                 "https://example.com/sqliu07/WaveFerry/releases/tag/v0.2.3",
                 "https://github.com.evil.com/sqliu07/WaveFerry/releases/tag/v0.2.3",
                 "https://github.com@evil.com/sqliu07/WaveFerry/releases/tag/v0.2.3",
                 "https://user@github.com/sqliu07/WaveFerry/releases/tag/v0.2.3",
+                "https://github.com:444/sqliu07/WaveFerry/releases/tag/v0.2.3",
                 "https://github.com/other/WaveFerry/releases/tag/v0.2.3",
                 "https://github.com/sqliu07/Other/releases/tag/v0.2.3",
-                "https://github.com/sqliu07/WaveFerry/releases/tag/v0.2.4",
                 TRUSTED_URL + "?redirect=https://example.com", TRUSTED_URL + "#fragment",
-                TRUSTED_URL + "/../../../../other", TRUSTED_URL.replace("v0.2.3", "%760.2.3")};
-        for (String url : invalid) {
-            expectRejected(() -> result("0.2.2", "v0.2.3", url, false, false));
+                "https://github.com/sqliu07/WaveFerry/releases/latest",
+                "/login", "//evil.com/sqliu07/WaveFerry/releases/tag/v0.2.3"};
+        for (String location : invalid) {
+            expectRejected(() -> check("0.2.2", location));
+        }
+    }
+
+    @Test
+    public void exposesAccessRestrictionStatusCodesAndOtherUnexpectedStatuses() throws Exception {
+        for (int status : new int[]{403, 429, 200, 304, 404, 500, 503}) {
+            FakeConnection connection = new FakeConnection();
+            connection.status = status;
+            try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection)) {
+                try {
+                    checker.check("0.2.2");
+                    fail("Accepted unexpected HTTP status");
+                } catch (ReleaseUpdateChecker.HttpException expected) {
+                    assertEquals(status, expected.getStatusCode());
+                }
+                assertEquals(1, connection.disconnectCount.get());
+            }
+        }
+    }
+
+    @Test
+    public void disconnectsAfterFailureAndAllowsAnotherCheck() throws Exception {
+        FakeConnection connection = new FakeConnection();
+        connection.status = 503;
+        try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection)) {
+            expectRejected(() -> checker.check("0.2.2"));
+            connection.status = 302;
+            assertTrue(checker.check("0.2.2").isUpdateAvailable());
+            assertEquals(2, connection.disconnectCount.get());
+        }
+    }
+
+    @Test
+    public void invalidInstalledVersionDoesNotOpenAConnection() throws Exception {
+        try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> {
+            fail("Opened a connection for invalid installed version");
+            return null;
+        })) {
+            expectRejected(() -> checker.check("unknown"));
         }
     }
 
@@ -98,73 +168,6 @@ public final class ReleaseUpdateCheckerTest {
     }
 
     @Test
-    public void httpErrorDisconnectsAndLeavesTheCheckerReadyToRetry() throws Exception {
-        FakeConnection connection = new FakeConnection();
-        ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection);
-        try {
-            expectRejected(() -> checker.check("0.2.2"));
-            expectRejected(() -> checker.check("0.2.2"));
-            assertEquals(2, connection.disconnectCount.get());
-            assertFalse(connection.inputOpened);
-            assertFalse(connection.getInstanceFollowRedirects());
-            assertEquals("application/vnd.github+json", connection.getRequestProperty("Accept"));
-            assertEquals("WaveFerry-UpdateChecker", connection.getRequestProperty("User-Agent"));
-            assertTrue(connection.getConnectTimeout() > 0);
-            assertTrue(connection.getReadTimeout() > 0);
-        } finally {
-            checker.close();
-        }
-    }
-
-    @Test
-    public void refusesRedirectWithoutReadingTheResponse() throws Exception {
-        FakeConnection connection = new FakeConnection();
-        connection.status = HttpsURLConnection.HTTP_MOVED_TEMP;
-        try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection)) {
-            expectRejected(() -> checker.check("0.2.2"));
-            assertFalse(connection.getInstanceFollowRedirects());
-            assertFalse(connection.inputOpened);
-            assertEquals(1, connection.disconnectCount.get());
-        }
-    }
-
-    @Test
-    public void refusesOversizedContentLengthBeforeReadingTheBody() throws Exception {
-        FakeConnection connection = new FakeConnection();
-        connection.status = HttpsURLConnection.HTTP_OK;
-        connection.responseLength = 512 * 1024 + 1;
-        try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection)) {
-            expectRejected(() -> checker.check("0.2.2"));
-            assertFalse(connection.inputOpened);
-            assertEquals(1, connection.disconnectCount.get());
-        }
-    }
-
-    @Test
-    public void capsUnknownLengthBodiesAndClosesTheStream() throws Exception {
-        FakeConnection connection = new FakeConnection();
-        connection.status = HttpsURLConnection.HTTP_OK;
-        connection.body = new TrackedInputStream(new byte[512 * 1024 + 1]);
-        try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection)) {
-            expectRejected(() -> checker.check("0.2.2"));
-            assertTrue(connection.body.closed);
-            assertEquals(1, connection.disconnectCount.get());
-        }
-    }
-
-    @Test
-    public void rejectsMalformedUtf8AndClosesTheStream() throws Exception {
-        FakeConnection connection = new FakeConnection();
-        connection.status = HttpsURLConnection.HTTP_OK;
-        connection.body = new TrackedInputStream(new byte[]{(byte) 0xc0, (byte) 0xaf});
-        try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection)) {
-            expectRejected(() -> checker.check("0.2.2"));
-            assertTrue(connection.body.closed);
-            assertEquals(1, connection.disconnectCount.get());
-        }
-    }
-
-    @Test
     public void closingDuringAnActiveRequestDisconnectsWithoutWaitingForItsLock() throws Exception {
         FakeConnection connection = new FakeConnection();
         connection.blockResponse = true;
@@ -192,9 +195,44 @@ public final class ReleaseUpdateCheckerTest {
         }
     }
 
-    private static ReleaseUpdateChecker.Result result(String installed, String tag, String url,
-            boolean draft, boolean prerelease) throws IOException {
-        return ReleaseUpdateChecker.resultForRelease(installed, tag, url, draft, prerelease);
+    @Test
+    public void rejectsConcurrentChecksAndDisconnectsTheUnusedConnection() throws Exception {
+        FakeConnection active = new FakeConnection();
+        active.blockResponse = true;
+        FakeConnection rejected = new FakeConnection();
+        AtomicInteger opened = new AtomicInteger();
+        ReleaseUpdateChecker checker = new ReleaseUpdateChecker(
+                () -> opened.incrementAndGet() == 1 ? active : rejected);
+        Thread request = new Thread(() -> {
+            try {
+                checker.check("0.2.2");
+            } catch (IOException expected) {
+                // The test closes the active request.
+            }
+        });
+        request.start();
+        try {
+            assertTrue(active.responseStarted.await(2, TimeUnit.SECONDS));
+            expectRejected(() -> checker.check("0.2.2"));
+            assertEquals(1, rejected.disconnectCount.get());
+        } finally {
+            checker.close();
+            request.interrupt();
+            request.join(2_000);
+        }
+        assertFalse(request.isAlive());
+    }
+
+    private static ReleaseUpdateChecker.Result check(String installed, String location) throws Exception {
+        FakeConnection connection = new FakeConnection();
+        connection.location = location;
+        try (ReleaseUpdateChecker checker = new ReleaseUpdateChecker(() -> connection)) {
+            try {
+                return checker.check(installed);
+            } finally {
+                assertEquals(1, connection.disconnectCount.get());
+            }
+        }
     }
 
     private static void expectRejected(CheckedAction action) throws Exception {
@@ -210,32 +248,16 @@ public final class ReleaseUpdateCheckerTest {
         void run() throws Exception;
     }
 
-    private static final class TrackedInputStream extends ByteArrayInputStream {
-        boolean closed;
-
-        TrackedInputStream(byte[] bytes) {
-            super(bytes);
-        }
-
-        @Override
-        public void close() throws IOException {
-            closed = true;
-            super.close();
-        }
-    }
-
     private static final class FakeConnection extends HttpsURLConnection {
         final AtomicInteger disconnectCount = new AtomicInteger();
         final CountDownLatch responseStarted = new CountDownLatch(1);
         final CountDownLatch disconnected = new CountDownLatch(1);
-        int status = HttpsURLConnection.HTTP_UNAVAILABLE;
-        long responseLength = -1;
+        int status = 302;
+        String location = TRUSTED_URL;
         boolean blockResponse;
-        boolean inputOpened;
-        TrackedInputStream body = new TrackedInputStream(new byte[0]);
 
         FakeConnection() throws Exception {
-            super(new URL("https://api.github.com/repos/sqliu07/WaveFerry/releases/latest"));
+            super(new URL("https://github.com/sqliu07/WaveFerry/releases/latest"));
         }
 
         @Override
@@ -256,14 +278,20 @@ public final class ReleaseUpdateCheckerTest {
         }
 
         @Override
-        public long getContentLengthLong() {
-            return responseLength;
+        public String getHeaderField(String name) {
+            return "Location".equalsIgnoreCase(name) ? location : null;
         }
 
         @Override
         public InputStream getInputStream() {
-            inputOpened = true;
-            return body;
+            fail("HEAD update check must not read a response body");
+            return null;
+        }
+
+        @Override
+        public InputStream getErrorStream() {
+            fail("HEAD update check must not read an error body");
+            return null;
         }
 
         @Override

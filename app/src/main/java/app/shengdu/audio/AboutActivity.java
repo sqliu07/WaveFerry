@@ -14,6 +14,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.IOException;
+import java.net.SocketTimeoutException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -67,7 +68,17 @@ public final class AboutActivity extends Activity {
                 ReleaseUpdateChecker.Result result = updateChecker.check(BuildConfig.VERSION_NAME);
                 mainHandler.post(() -> showUpdateResult(result));
             } catch (IOException | SecurityException exception) {
-                mainHandler.post(this::showUpdateFailure);
+                int message = R.string.about_update_failed;
+                if (exception instanceof ReleaseUpdateChecker.HttpException) {
+                    int statusCode = ((ReleaseUpdateChecker.HttpException) exception).getStatusCode();
+                    if (statusCode == 403 || statusCode == 429) {
+                        message = R.string.about_update_access_limited;
+                    }
+                } else if (exception instanceof SocketTimeoutException) {
+                    message = R.string.about_update_timeout;
+                }
+                int failureMessage = message;
+                mainHandler.post(() -> showUpdateFailure(failureMessage));
             }
         });
     }
@@ -90,12 +101,18 @@ public final class AboutActivity extends Activity {
                 .show();
     }
 
-    private void showUpdateFailure() {
+    private void showUpdateFailure(int message) {
         if (isFinishing() || isDestroyed()) {
             return;
         }
         finishUpdateCheck();
-        Toast.makeText(this, R.string.about_update_failed, Toast.LENGTH_LONG).show();
+        updateDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.about_update_failed_title)
+                .setMessage(message)
+                .setPositiveButton(R.string.about_open_release,
+                        (dialog, which) -> openExternalUrl(getString(R.string.latest_release_url)))
+                .setNegativeButton(R.string.about_later, null)
+                .show();
     }
 
     private void finishUpdateCheck() {
