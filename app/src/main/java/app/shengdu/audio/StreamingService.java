@@ -19,7 +19,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.PowerManager;
 
-import app.shengdu.audio.audio.DeviceMutePolicy;
+import app.shengdu.audio.audio.DeviceMuteController;
 import app.shengdu.audio.capture.PlaybackCapture;
 import app.shengdu.audio.dacp.DacpControlServer;
 import app.shengdu.audio.dacp.DacpSession;
@@ -130,7 +130,8 @@ public final class StreamingService extends Service {
     private volatile ReceiverDevice activeReceiverDevice;
     private boolean awaitingCapture;
     private boolean activeMuteDevice;
-    private final DeviceMutePolicy mutePolicy = new DeviceMutePolicy();
+    private final DeviceMuteController muteController = new DeviceMuteController();
+    private DeviceMuteController.VolumeControl deviceVolume;
     private final PlaybackFlowGate playbackFlowGate = new PlaybackFlowGate();
     private final TrackProgressSender trackProgressSender = new TrackProgressSender();
 
@@ -183,6 +184,7 @@ public final class StreamingService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        deviceVolume = new MusicStreamVolume(getSystemService(AudioManager.class));
         createNotificationChannel();
     }
 
@@ -445,13 +447,21 @@ public final class StreamingService extends Service {
             receiverName = activeReceiverName;
             awaitingCapture = false;
         }
-        if (muteDevice && !applyDeviceMuteForGeneration(generation)) {
-            return false;
+        boolean muteApplied = true;
+        if (muteDevice) {
+            synchronized (muteLifecycleLock) {
+                if (!isCurrentGeneration(generation) || stopping.get()) {
+                    return false;
+                }
+                muteApplied = muteController.mute(deviceVolume);
+            }
         }
         return broadcastSessionStatus(
                 generation,
                 STATUS_STREAMING,
-                getString(R.string.status_streaming_receiver, receiverName));
+                getString(muteApplied
+                        ? R.string.status_streaming_receiver
+                        : R.string.status_streaming_receiver_mute_failed, receiverName));
     }
 
     private boolean broadcastSessionStatus(int generation, String status, String message) {
@@ -989,45 +999,38 @@ public final class StreamingService extends Service {
         }
     }
 
-    /**
-     * Optional "mute this device while casting": sets the music stream to 0 after the
-     * session is up and restores the previous volume on stop, unless the user picked a
-     * new volume in the meantime. Capture duplicates the mix, so the receiver is unaffected.
-     */
-    private void applyDeviceMute(boolean enabled) {
-        if (!enabled) {
-            return;
-        }
-        AudioManager audioManager = getSystemService(AudioManager.class);
-        int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-        int target;
-        synchronized (mutePolicy) {
-            target = mutePolicy.onStreamingStarted(true, current);
-        }
-        if (target != DeviceMutePolicy.NO_CHANGE) {
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
-        }
-    }
+    /** Android boundary for verified, best-effort local media muting. */
+    private static final class MusicStreamVolume implements DeviceMuteController.VolumeControl {
+        private final AudioManager audioManager;
 
-    private boolean applyDeviceMuteForGeneration(int generation) {
-        synchronized (muteLifecycleLock) {
-            if (!isCurrentGeneration(generation) || stopping.get()) {
-                return false;
-            }
-            applyDeviceMute(true);
-            return true;
+        private MusicStreamVolume(AudioManager audioManager) {
+            this.audioManager = audioManager;
         }
-    }
 
-    private void restoreDeviceVolume() {
-        AudioManager audioManager = getSystemService(AudioManager.class);
-        int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-        int restored;
-        synchronized (mutePolicy) {
-            restored = mutePolicy.onStreamingStopped(current);
+        @Override
+        public int getVolume() {
+            return audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
         }
-        if (restored != DeviceMutePolicy.NO_CHANGE) {
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, restored, 0);
+
+        @Override
+        public boolean isMuted() {
+            return audioManager.isStreamMute(AudioManager.STREAM_MUSIC);
+        }
+
+        @Override
+        public boolean isFixedVolume() {
+            return audioManager.isVolumeFixed();
+        }
+
+        @Override
+        public void setVolume(int index) {
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, index, 0);
+        }
+
+        @Override
+        public void setMuted(boolean muted) {
+            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC,
+                    muted ? AudioManager.ADJUST_MUTE : AudioManager.ADJUST_UNMUTE, 0);
         }
     }
 
@@ -1141,7 +1144,7 @@ public final class StreamingService extends Service {
             trackProgressSender.reset();
         }
         synchronized (muteLifecycleLock) {
-            restoreDeviceVolume();
+            muteController.restore(deviceVolume);
         }
 
         if (capture != null) {

@@ -13,6 +13,7 @@
     <string name="status_receiver_connected">连接成功 · 点击继续</string>
     <string name="status_starting_capture">正在启动音频投送…</string>
     <string name="status_streaming_receiver">正在投送到 %1$s</string>
+    <string name="status_streaming_receiver_mute_failed">正在投送到 %1$s · 本机未能自动静音，请手动调低媒体音量</string>
     <string name="capture_session_missing">接收器连接已失效，请重新连接</string>
 
     <string name="receiver_empty">未发现设备</string>
