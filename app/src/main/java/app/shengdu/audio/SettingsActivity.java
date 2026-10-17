@@ -69,6 +69,8 @@ public final class SettingsActivity extends Activity {
         });
         notificationAccessButton.setOnClickListener(
                 view -> startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)));
+        findViewById(R.id.button_about).setOnClickListener(
+                view -> startActivity(new Intent(this, AboutActivity.class)));
     }
 
     private static void setQualitySelection(

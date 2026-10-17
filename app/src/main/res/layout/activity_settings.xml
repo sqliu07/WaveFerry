@@ -131,5 +131,19 @@
             android:layout_marginTop="@dimen/space_s"
             android:text="@string/settings_notification_access_off"
             style="@style/Shengdu.Button.Secondary" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="@dimen/space_section"
+            android:background="@color/shengdu_border" />
+
+        <Button
+            android:id="@+id/button_about"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_section"
+            android:text="@string/about_title"
+            style="@style/Shengdu.Button.Secondary" />
     </LinearLayout>
 </ScrollView>

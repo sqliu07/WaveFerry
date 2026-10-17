@@ -80,8 +80,8 @@ UDP 接收循环内同步下载设备 XML 并查询能力；4 秒扫描截止时
 
 验证结果：
 
-- 标准 Gradle 流程的 219 项单元测试全部通过，其中包含 22 项新增静音控制器测试。
+- 标准 Gradle 流程的 236 项单元测试全部通过，其中包含 22 项新增静音控制器测试和 17 项新增更新检查测试。
 - Debug 和 Release 的 Android lint 均通过，无错误；各有一项现有 JUnit 版本升级提示。
 - `assembleRelease` 和 `bundleRelease` 均成功，离线构建复用 Android SDK 36 随附的 AAPT2。
 - Release APK 和 AAB 的签名验证通过，证书与此前签名的 Release 包一致；APK 的 zipalign 和非调试模式检查通过。产物为 `app/build/outputs/apk/release/app-release.apk` 和 `app/build/outputs/bundle/release/app-release.aab`。
-- 代码复审通过。尚未进行 OPPO Find X8 Ultra 及接收端音频的真机验证。
+- 代码复审通过。尚未进行 OPPO Find X8 Ultra、接收端音频以及新增关于页面的真机验证。

@@ -45,8 +45,8 @@ android {
         applicationId = "app.shengdu.audio"
         minSdk = 31
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.2.1"
+        versionCode = 13
+        versionName = "0.2.2"
 
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }
