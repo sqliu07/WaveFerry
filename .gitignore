@@ -20,3 +20,5 @@ keystore.properties
 *.hprof
 .DS_Store
 Thumbs.db
+
+/local/

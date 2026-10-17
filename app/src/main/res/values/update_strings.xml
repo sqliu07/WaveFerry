@@ -7,11 +7,11 @@
     <string name="about_download_progress">Update download progress</string>
     <string name="about_downloading_update">Downloading %1$s…</string>
     <string name="about_downloading_progress">Downloading %1$s · %2$d%%</string>
-    <string name="about_download_waiting">Waiting for a network connection. You can leave this page; the download will continue.</string>
+    <string name="about_download_waiting">Connecting to the download server…</string>
     <string name="about_download_ready">%1$s is ready to install</string>
     <string name="about_download_failed_title">Update download failed</string>
     <string name="about_download_failed">The download could not finish. Check for updates to retry, or open the release page.</string>
-    <string name="about_download_unavailable">Unable to access the system download service. You can download the APK from the release page.</string>
+    <string name="about_download_unavailable">Unable to start or read the download. Try again, or download the APK from the release page.</string>
     <string name="about_verifying_update">Verifying update…</string>
     <string name="about_update_verification_failed">Unable to verify this update. Delete the download and try again, or visit the release page.</string>
     <string name="about_installer_unavailable">Unable to open the system installer or its settings. You can download the APK from the release page.</string>

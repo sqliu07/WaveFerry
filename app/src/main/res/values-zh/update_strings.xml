@@ -7,11 +7,11 @@
     <string name="about_download_progress">更新下载进度</string>
     <string name="about_downloading_update">正在下载 %1$s…</string>
     <string name="about_downloading_progress">正在下载 %1$s · %2$d%%</string>
-    <string name="about_download_waiting">正在等待网络连接，可以离开此页面，下载会继续。</string>
+    <string name="about_download_waiting">正在连接下载服务器…</string>
     <string name="about_download_ready">%1$s 已下载，可以安装</string>
     <string name="about_download_failed_title">更新下载失败</string>
     <string name="about_download_failed">下载未能完成，请检查更新后重试，或前往发布页下载。</string>
-    <string name="about_download_unavailable">暂时无法使用系统下载服务，可以前往发布页下载 APK。</string>
+    <string name="about_download_unavailable">暂时无法开始或读取下载，请重试，或前往发布页下载 APK。</string>
     <string name="about_verifying_update">正在验证更新…</string>
     <string name="about_update_verification_failed">无法验证此更新，请删除下载后重试，或前往发布页查看。</string>
     <string name="about_installer_unavailable">无法打开系统安装器或相关设置，可以前往发布页下载 APK。</string>
