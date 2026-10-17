@@ -31,8 +31,8 @@ for later versions. The APK must keep the package name and current signing
 certificate set and have a strictly greater `versionCode`. Key rotation is not
 supported by the in-app downloader's certificate check.
 
-Downloads use Android DownloadManager, remain available after leaving About,
-and can be canceled or deleted there. No storage-wide permission is required.
+Downloads run in the app, remain active while its process is alive,
+and can be canceled or deleted from About. No storage-wide permission is required.
 Installing an update still requires the Android unknown-source permission and
 system confirmation. If the system service or installer is unavailable, use the
 release-page fallback.
