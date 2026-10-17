@@ -124,7 +124,7 @@ public final class DlnaAvTransportClientTest {
                     String soapAction = header(headers, "soapaction");
                     actions.add(soapAction + "\n" + new String(body, StandardCharsets.UTF_8));
                     OutputStream output = socket.getOutputStream();
-                    output.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    output.write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
                             .getBytes(StandardCharsets.US_ASCII));
                     output.flush();
                 }
@@ -142,7 +142,7 @@ public final class DlnaAvTransportClientTest {
             String headers = readHeaders(socket.getInputStream());
             socket.getInputStream().readNBytes(contentLength(headers));
             OutputStream output = socket.getOutputStream();
-            output.write(("HTTP/1.1 500 Internal Server Error\r\nContent-Length: "
+            output.write(("HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: "
                     + body.getBytes(StandardCharsets.UTF_8).length + "\r\n\r\n" + body)
                     .getBytes(StandardCharsets.UTF_8));
             output.flush();
@@ -160,7 +160,7 @@ public final class DlnaAvTransportClientTest {
             String headers = readHeaders(socket.getInputStream());
             socket.getInputStream().readNBytes(contentLength(headers));
             OutputStream output = socket.getOutputStream();
-            output.write(("HTTP/1.1 200 OK\r\nContent-Length: "
+            output.write(("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: "
                     + body.getBytes(StandardCharsets.UTF_8).length + "\r\n\r\n" + body)
                     .getBytes(StandardCharsets.UTF_8));
             output.flush();
@@ -177,7 +177,7 @@ public final class DlnaAvTransportClientTest {
             String headers = readHeaders(socket.getInputStream());
             socket.getInputStream().readNBytes(contentLength(headers));
             OutputStream output = socket.getOutputStream();
-            output.write(("HTTP/1.1 200 OK\r\nContent-Length: "
+            output.write(("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: "
                     + body.getBytes(StandardCharsets.UTF_8).length + "\r\n\r\n" + body)
                     .getBytes(StandardCharsets.UTF_8));
             output.flush();
